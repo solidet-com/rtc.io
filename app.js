@@ -138,7 +138,7 @@ async function toggleMediaSharing() {
         }
     }
 
-    currentStream.getTracks().forEach((track) => replacePeerTracks(track));
+    currentStream.getTracks().forEach((track) => replacePeerTrack(track));
 
     localVideo.srcObject = currentStream;
 }
