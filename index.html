@@ -1,28 +1,13 @@
 <!DOCTYPE html>
-<html>
-    <head>
-        <title>WebRTC</title>
-        <link rel="stylesheet" type="text/css" media="screen" href="main.css" />
-    </head>
-    <body>
-        <div id="videos">
-            <video class="video-player" id="localVideo" autoplay playsinline></video>
-            <video class="video-player" id="remoteVideo" autoplay playsinline></video>
-            <video style="display: none" id="streamFileVideo" autoplay playsinline></video>
-        </div>
-        <button id="switchMediaButton">Switch Media</button>
-        <input onchange="changeTimestamp()" id="movieTime" type="range" min="0" max="100" value="0" />
-        <button
-            onclick="
-            const streamVideo = document.getElementById('streamFileVideo');
-            if (streamVideo.paused) streamVideo.play();
-            else streamVideo.pause();
-        "
-        >
-            Play/Pause
-        </button>
-        <input id="streamFileInput" type="file" accept="video/*" />
-    </body>
-    <script type="module" src="app.js"></script>
-    <script defer></script>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebRTC - Join Room</title>
+</head>
+<body>
+  <video id="video1" autoplay muted controls width="1024" allowfullscreen></video>
+
+  <script defer type="module" src="main.js"></script>
+</body>
 </html>
