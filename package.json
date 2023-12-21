@@ -1,39 +1,32 @@
 {
-  "name": "rtc.io",
-  "version": "0.0.0",
-  "description": "WebRTC + socket.io components for Node.js",
-  "keywords": [
-    "webrtc",
-    "rtc.io",
-    "signalling server",
-    "websocket",
-    "realtime",
-    "framework",
-    "tcp",
-    "events",
-    "socket",
-    "io"
-  ],
-  "scripts": {
-    "compile": "rimraf ./dist && tsc",
-    "test": "npm run format:check && npm run compile && npm run test:types && npm run test:unit",
-    "test:types": "tsd",
-    "test:unit": "nyc mocha --require ts-node/register --reporter spec --slow 200 --bail --timeout 10000 test/index.ts",
-    "format:check": "prettier --check \"lib/**/*.ts\" \"test/**/*.ts\"",
-    "format:fix": "prettier --write \"lib/**/*.ts\" \"test/**/*.ts\"",
-    "prepack": "npm run compile"
-  },
-  "dependencies": {
-    "express": "^4.18.2",
-    "ws": "^8.14.2"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.1",
-    "prettier": "^3.0.3",
-    "typescript": "^5.2.2",
-    "@types/express": "^4.17.13",
-    "@types/node": "^16.11.7",
-    "@types/ws": "^8.0.4",
-    "ts-node": "^10.4.0"
-  }
+	"name": "rtcio",
+	"version": "0.0.1",
+	"description": "WebRTC + socket.io components for Node.js",
+	"keywords": [
+		"webrtc",
+		"rtc.io",
+		"signalling server",
+		"websocket",
+		"realtime",
+		"framework",
+		"tcp",
+		"events",
+		"socket",
+		"io"
+	],
+	"scripts": {},
+	"dependencies": {
+		"express": "^4.18.2",
+		"socket.io": "^4.7.2",
+		"socket.io-client": "^4.7.2"
+	},
+	"devDependencies": {
+		"@types/express": "^4.17.13",
+		"@types/node": "^16.11.7",
+		"@types/ws": "^8.0.4",
+		"nodemon": "^3.0.1",
+		"prettier": "^3.0.3",
+		"ts-node": "^10.4.0",
+		"typescript": "^5.2.2"
+	}
 }
