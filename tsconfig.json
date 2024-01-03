@@ -3,7 +3,8 @@
 		"target": "es5",
 		"module": "commonjs",
 		"strict": true,
-		"esModuleInterop": true
+		"esModuleInterop": true,
+		"noImplicitAny": false
 	},
 	"include": ["lib/**/*", "index.ts"],
 	"exclude": ["node_modules"]
