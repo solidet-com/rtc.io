@@ -3,6 +3,7 @@ import {
 	Socket as RootSocket,
 } from "socket.io-client";
 import { Manager } from "./manager";
+import { getRTCStats, getRTCIceCandidateStatsReport } from "./stats/stats.js";
 
 export interface SocketOptions extends Partial<RootSocketOptions> {
 	iceServers: RTCIceServer[];
@@ -13,6 +14,8 @@ export class Socket extends RootSocket {
 	private testpeer?: RTCPeerConnection;
 	private localStream?: MediaStream;
 	private rtcId: string;
+	private iceEvents = ["offer", "answer", "candidate"];
+	private userEvents = ["user-joined", "user-left"];
 	public remoteStream: MediaStream;
 
 	private readonly servers = {
@@ -33,7 +36,7 @@ export class Socket extends RootSocket {
 		this.rtcId = String(Math.floor(Math.random() * 10000));
 	}
 
-	createPeerConnection = async (MemberId: any, fromId: any) => {
+	createPeerConnection = async (uid: any, fromId: any) => {
 		if (!this.localStream) return;
 
 		this.testpeer = new RTCPeerConnection(this.servers);
@@ -53,11 +56,9 @@ export class Socket extends RootSocket {
 
 		this.testpeer.onicecandidate = async (event) => {
 			if (event.candidate) {
-				this.emit("message", {
-					type: "candidate",
-					category: "MessageFromPeer",
+				this.emit("candidate", {
 					candidate: event.candidate,
-					MemberId,
+					uid,
 				});
 			}
 		};
@@ -75,14 +76,53 @@ export class Socket extends RootSocket {
 		this.localStream = stream;
 
 		this._login();
-
-		this.on("message", this._onmediastream);
+		this.userEvents.forEach((eventName) => {
+			this.on(eventName, (data) => {
+				this._onuseraction(eventName, data);
+			});
+		});
+		this.iceEvents.forEach((eventName) => {
+			this.on(eventName, (data) => {
+				this._onmediastream(eventName, data);
+			});
+		});
 	};
+	async getStats() {
+		if (!this.testpeer) {
+			return null;
+		}
+
+		const statsMap = new Map();
+
+		return new Promise((resolve) => {
+			this.testpeer!.getStats().then((stats) => {
+				stats.forEach((report) => {
+					const { type } = report;
+
+					if (!statsMap.has(type)) {
+						statsMap.set(type, []);
+					}
+
+					statsMap.get(type).push({ report, description: type });
+				});
+
+				resolve(statsMap);
+			});
+		});
+	}
+
+	async getSessionStats() {
+		if (!this.testpeer) return null;
+		return await getRTCStats(this.testpeer, {});
+	}
+
+	async getIceCandidateStats() {
+		if (!this.testpeer) return null;
+		return await getRTCIceCandidateStatsReport(this.testpeer);
+	}
 
 	_login() {
-		this.emit("message", {
-			category: "Login",
-			type: "",
+		this.emit("login", {
 			uid: this.rtcId,
 			room: "/",
 		});
@@ -92,57 +132,73 @@ export class Socket extends RootSocket {
 		return super.emit(ev, ...args);
 	}
 
-	private _onmediastream = (data: any) => {
-		if (data.category === "MemberJoined") {
-			this.handleUserJoined(data.uid, data.from);
-		}
+	private _onmediastream = (event: string, data: any) => {
+		this.handleMessageFromPeer(event, data, data.uid, data.from);
+	};
 
-		if (data.category === "MemberLeft") {
-			this.handleUserLeft(data.uid);
-		}
+	private _onuseraction = (eventName: string, data: any) => {
+		switch (eventName) {
+			case "user-joined":
+				console.log("biri girdi");
+				this.handleUserJoined(data.uid, data.from);
+				break;
 
-		if (data.category === "MessageFromPeer") {
-			this.handleMessageFromPeer(data, data.MemberId, data.from);
+			case "user-left":
+				console.log("biri çıktı");
+				this.handleUserLeft(data.uid);
+				break;
+
+			default:
+				console.warn("Unhandled event:", eventName);
 		}
 	};
 
-	handleUserJoined = async (MemberId: any, fromId) => {
-		this.createOffer(MemberId, fromId);
+	handleUserJoined = async (uid: any, fromId) => {
+		console.log("biri girdi");
+		this.createOffer(uid, fromId);
 	};
 
-	createOffer = async (MemberId, fromId) => {
-		await this.createPeerConnection(MemberId, fromId);
+	createOffer = async (uid, fromId) => {
+		await this.createPeerConnection(uid, fromId);
 
 		if (!this.testpeer) return;
 
 		let offer = await this.testpeer.createOffer();
 		await this.testpeer.setLocalDescription(offer);
-		this.emit("message", {
-			category: "MessageFromPeer",
-			type: "offer",
+		this.emit("offer", {
 			offer: offer,
-			MemberId: MemberId,
+			uid,
+			from: fromId,
 		});
 	};
 
-	async handleMessageFromPeer(message, MemberId, from) {
-		if (message.type == "offer") {
-			this.createAnswer(MemberId, message.offer, from);
-		}
+	async handleMessageFromPeer(event, message, uid, from) {
+		switch (event) {
+			case "offer":
+				console.log("offfer");
+				this.createAnswer(uid, message.offer, from);
+				break;
 
-		if (message.type == "answer") {
-			this.addAnswer(message.answer);
-		}
+			case "answer":
+				console.log("answer");
 
-		if (message.type == "candidate") {
-			if (this.testpeer) {
-				this.testpeer
-					.addIceCandidate(message.candidate)
-					.then(() => {})
-					.catch((error) => {
-						console.error("Error adding ICE candidate:", error);
-					});
-			}
+				this.addAnswer(message.answer);
+				break;
+
+			case "candidate":
+				console.log("candidate");
+				if (this.testpeer) {
+					this.testpeer
+						.addIceCandidate(message.candidate)
+						.then(() => {})
+						.catch((error) => {
+							console.error("Error adding ICE candidate:", error);
+						});
+				}
+				break;
+
+			default:
+				console.warn("Unhandled event:", event);
 		}
 	}
 
@@ -156,8 +212,8 @@ export class Socket extends RootSocket {
 		console.log("final addAnswer");
 	}
 
-	async createAnswer(MemberId, offer, from) {
-		await this.createPeerConnection(MemberId, from)
+	async createAnswer(uid, offer, from) {
+		await this.createPeerConnection(uid, from)
 			.then(() => {})
 			.catch((error) => {
 				console.error("Error creating peer connection:", error);
@@ -169,15 +225,19 @@ export class Socket extends RootSocket {
 		let answer = await this.testpeer.createAnswer();
 		await this.testpeer.setLocalDescription(answer);
 
-		this.emit("message", {
-			type: "answer",
-			category: "MessageFromPeer",
+		this.emit("answer", {
 			answer: answer,
-			MemberId: MemberId,
+			uid,
+			from,
 		});
 	}
 
-	handleUserLeft(MemberId) {
+	handleUserLeft(uid) {
 		// dispatchEvent("rtc-disconnect", MemberId);
+		this.listeners("user-left").forEach((listener) => {
+			listener(uid);
+		});
 	}
+
+
 }
