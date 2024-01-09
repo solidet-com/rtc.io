@@ -53,13 +53,7 @@ export class Socket extends RootSocket {
 		};
 
 		const peer = this.rtcpeers[source];
-
-		this.localStream?.getTracks().forEach((track) => {
-			if (!peer.connection) return;
-			if (!this.localStream) return;
-
-			peer.connection.addTrack(track, this.localStream);
-		});
+		this._stream(peer);
 
 		peer.connection.ontrack = (event) => {
 			event.streams[0].getTracks().forEach((track) => {
@@ -69,6 +63,16 @@ export class Socket extends RootSocket {
 				);
 				peer.mediaStream.addTrack(track);
 			});
+		};
+
+		peer.connection.oniceconnectionstatechange = () => {
+			if (peer.connection.iceConnectionState === "disconnected") {
+				this.listeners("peer-disconnect").forEach((listener) => {
+					listener({
+						peerId: source,
+					});
+				});
+			}
 		};
 
 		peer.connection.onicecandidate = async (event) => {
@@ -96,9 +100,23 @@ export class Socket extends RootSocket {
 	stream = async (stream: MediaStream) => {
 		if (!this.connected) return;
 
+		if (this.localStream) {
+			throw new Error("Stream already exists");
+			//TODO: new stream can override the existing one
+		}
+
 		this.localStream = stream;
-		//TODO: Check if peers have local stream already
 	};
+
+	private _stream = (peer: RTCPeer) => {
+		this.localStream?.getTracks().forEach((track) => {
+			if (!peer.connection) return;
+			if (!this.localStream) return;
+
+			peer.connection.addTrack(track, this.localStream);
+		});
+	};
+
 	async getStats(peerId: string) {
 		const peerConnection = this.getPeer(peerId)?.connection;
 		if (!peerConnection) {
