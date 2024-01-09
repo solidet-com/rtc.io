@@ -10,13 +10,18 @@ export interface SocketOptions extends Partial<RootSocketOptions> {
 }
 
 export class Socket extends RootSocket {
-	private rtcpeers: Record<string, RTCPeerConnection[]>;
-	private testpeer?: RTCPeerConnection;
+	private rtcpeers: Record<
+		string,
+		{
+			connection: RTCPeerConnection;
+			mediaStream: MediaStream;
+			handshaked?: boolean;
+		}
+	>;
 	private localStream?: MediaStream;
-	private rtcId: string;
+	public rtcId?: string;
 	private iceEvents = ["offer", "answer", "candidate"];
 	private userEvents = ["user-joined", "user-left"];
-	public remoteStream: MediaStream;
 
 	private readonly servers = {
 		iceServers: [
@@ -32,29 +37,36 @@ export class Socket extends RootSocket {
 	constructor(io: Manager, nsp: string, opts?: Partial<SocketOptions>) {
 		super(io, nsp, opts);
 		this.rtcpeers = {};
-		this.remoteStream = new MediaStream();
-		this.rtcId = String(Math.floor(Math.random() * 10000));
 	}
 
 	createPeerConnection = async (uid: any, fromId: any) => {
-		if (!this.localStream) return;
+		const peerConnection = new RTCPeerConnection(this.servers);
 
-		this.testpeer = new RTCPeerConnection(this.servers);
+		this.rtcpeers[fromId] = {
+			connection: peerConnection,
+			mediaStream: new MediaStream(),
+		};
 
-		this.localStream.getTracks().forEach((track) => {
-			if (!this.testpeer) return;
+		const peer = this.rtcpeers[fromId];
+
+		this.localStream?.getTracks().forEach((track) => {
+			if (!peer.connection) return;
 			if (!this.localStream) return;
 
-			this.testpeer.addTrack(track, this.localStream);
+			peer.connection.addTrack(track, this.localStream);
 		});
 
-		this.testpeer.ontrack = (event) => {
+		peer.connection.ontrack = (event) => {
 			event.streams[0].getTracks().forEach((track) => {
-				this.remoteStream.addTrack(track);
+				console.log(
+					"adding track to peer media stream",
+					peer.mediaStream,
+				);
+				peer.mediaStream.addTrack(track);
 			});
 		};
 
-		this.testpeer.onicecandidate = async (event) => {
+		peer.connection.onicecandidate = async (event) => {
 			if (event.candidate) {
 				this.emit("candidate", {
 					candidate: event.candidate,
@@ -62,10 +74,26 @@ export class Socket extends RootSocket {
 				});
 			}
 		};
+
+		peer.connection.onicegatheringstatechange = (event) => {
+			console.log("icegatheringstatechange", peer.connection.iceGatheringState);
+			switch (peer.connection.iceGatheringState) {
+				case "new":
+					/* gathering is either just starting or has been reset */
+					break;
+				case "gathering":
+					/* gathering has begun or is ongoing */
+					break;
+				case "complete":
+					peer.handshaked = true;		
+					break;
+			}
+		};
+
 		this.listeners("stream").forEach((listener) => {
 			listener({
 				streamerId: fromId,
-				mediaStream: this.remoteStream,
+				mediaStream: peer.mediaStream,
 			});
 		});
 	};
@@ -81,21 +109,26 @@ export class Socket extends RootSocket {
 				this._onuseraction(eventName, data);
 			});
 		});
+
+		this.on("login", (data) => {
+			this.rtcId = data;
+		});
 		this.iceEvents.forEach((eventName) => {
 			this.on(eventName, (data) => {
 				this._onmediastream(eventName, data);
 			});
 		});
 	};
-	async getStats() {
-		if (!this.testpeer) {
+	async getStats(peerId: string) {
+		const peerConnection = this.getPeer(peerId)?.connection;
+		if (!peerConnection) {
 			return null;
 		}
 
 		const statsMap = new Map();
 
 		return new Promise((resolve) => {
-			this.testpeer!.getStats().then((stats) => {
+			peerConnection!.getStats().then((stats) => {
 				stats.forEach((report) => {
 					const { type } = report;
 
@@ -111,19 +144,20 @@ export class Socket extends RootSocket {
 		});
 	}
 
-	async getSessionStats() {
-		if (!this.testpeer) return null;
-		return await getRTCStats(this.testpeer, {});
+	async getSessionStats(peerId) {
+		const peerConnection = this.getPeer(peerId)?.connection;
+		if (!peerConnection) return null;
+		return await getRTCStats(peerConnection, {});
 	}
 
-	async getIceCandidateStats() {
-		if (!this.testpeer) return null;
-		return await getRTCIceCandidateStatsReport(this.testpeer);
+	async getIceCandidateStats(peerId) {
+		const peerConnection = this.getPeer(peerId)?.connection;
+		if (!peerConnection) return null;
+		return await getRTCIceCandidateStatsReport(peerConnection);
 	}
 
 	_login() {
 		this.emit("login", {
-			uid: this.rtcId,
 			room: "/",
 		});
 	}
@@ -139,12 +173,12 @@ export class Socket extends RootSocket {
 	private _onuseraction = (eventName: string, data: any) => {
 		switch (eventName) {
 			case "user-joined":
-				console.log("biri girdi");
+				console.log("biri girdi", data);
 				this.handleUserJoined(data.uid, data.from);
 				break;
 
 			case "user-left":
-				console.log("biri çıktı");
+				console.log("biri çıktı", data);
 				this.handleUserLeft(data.uid);
 				break;
 
@@ -160,11 +194,11 @@ export class Socket extends RootSocket {
 
 	createOffer = async (uid, fromId) => {
 		await this.createPeerConnection(uid, fromId);
+		const peerConnection = this.getPeer(fromId)?.connection;
+		if (!peerConnection) return;
 
-		if (!this.testpeer) return;
-
-		let offer = await this.testpeer.createOffer();
-		await this.testpeer.setLocalDescription(offer);
+		let offer = await peerConnection.createOffer();
+		await peerConnection.setLocalDescription(offer);
 		this.emit("offer", {
 			offer: offer,
 			uid,
@@ -173,22 +207,23 @@ export class Socket extends RootSocket {
 	};
 
 	async handleMessageFromPeer(event, message, uid, from) {
+		const peer = this.getPeer(from);
+		const peerConnection = peer?.connection;
+
 		switch (event) {
 			case "offer":
-				console.log("offfer");
+				// if (peer?.handshaked) return;
 				this.createAnswer(uid, message.offer, from);
 				break;
 
 			case "answer":
-				console.log("answer");
-
-				this.addAnswer(message.answer);
+				// if (peer?.handshaked) return;
+				this.addAnswer(message.answer, from);
 				break;
 
 			case "candidate":
-				console.log("candidate");
-				if (this.testpeer) {
-					this.testpeer
+				if (peerConnection) {
+					peerConnection
 						.addIceCandidate(message.candidate)
 						.then(() => {})
 						.catch((error) => {
@@ -202,42 +237,49 @@ export class Socket extends RootSocket {
 		}
 	}
 
-	async addAnswer(answer: RTCSessionDescriptionInit) {
-		console.log("before addAnswer");
-		if (!this.testpeer) return;
-		console.log("after addAnswer");
-		if (!this.testpeer.currentRemoteDescription) {
-			this.testpeer.setRemoteDescription(answer);
+	async addAnswer(answer: RTCSessionDescriptionInit, from: string) {
+		const peer = this.getPeer(from);
+		if (!peer) return;
+
+		if (!peer?.connection.currentRemoteDescription) {
+			peer.connection.setRemoteDescription(answer);
 		}
-		console.log("final addAnswer");
 	}
 
 	async createAnswer(uid, offer, from) {
+		const peer = this.getPeer(from);
+		if (peer?.handshaked) {
+			console.log("peer already exists");
+			return;
+		}
+
 		await this.createPeerConnection(uid, from)
 			.then(() => {})
 			.catch((error) => {
 				console.error("Error creating peer connection:", error);
 			});
 
-		if (!this.testpeer) return;
-		await this.testpeer.setRemoteDescription(offer);
+		const peerConnection = this.rtcpeers[from]?.connection;
+		if (!peerConnection) return;
+		await peerConnection.setRemoteDescription(offer);
 
-		let answer = await this.testpeer.createAnswer();
-		await this.testpeer.setLocalDescription(answer);
+		let answer = await peerConnection.createAnswer();
+		await peerConnection.setLocalDescription(answer);
 
 		this.emit("answer", {
 			answer: answer,
 			uid,
-			from,
 		});
+	}
+
+	getPeer(uid) {
+		return this.rtcpeers[uid];
 	}
 
 	handleUserLeft(uid) {
 		// dispatchEvent("rtc-disconnect", MemberId);
-		this.listeners("user-left").forEach((listener) => {
+		this.listeners("user-left2").forEach((listener) => {
 			listener(uid);
 		});
 	}
-
-
 }
