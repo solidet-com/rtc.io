@@ -12,12 +12,13 @@ export interface SocketOptions extends Partial<RootSocketOptions> {
 type RTCPeer = {
 	connection: RTCPeerConnection;
 	mediaStream: MediaStream;
+	socketId: string;
+	signalState: RTCSignalingState;
 };
 
 export class Socket extends RootSocket {
 	private rtcpeers: Record<string, RTCPeer>;
 	private localStream?: MediaStream;
-	private iceEvents = ["offer", "answer", "candidate"];
 
 	private readonly servers = {
 		iceServers: [
@@ -50,6 +51,8 @@ export class Socket extends RootSocket {
 		this.rtcpeers[source] = {
 			connection: peerConnection,
 			mediaStream: new MediaStream(),
+			socketId: source,
+			signalState: peerConnection.signalingState,
 		};
 
 		const peer = this.rtcpeers[source];
@@ -66,12 +69,30 @@ export class Socket extends RootSocket {
 		};
 
 		peer.connection.oniceconnectionstatechange = () => {
-			if (peer.connection.iceConnectionState === "disconnected") {
-				this.listeners("peer-disconnect").forEach((listener) => {
-					listener({
-						peerId: source,
+			switch (peer.connection.iceConnectionState) {
+				case "connected":
+					this.listeners("stream").forEach((listener) => {
+						listener({
+							streamerId: source,
+							mediaStream: peer.mediaStream,
+						});
 					});
-				});
+					break;
+				case "disconnected":
+					this.listeners("peer-disconnect").forEach((listener) => {
+						listener({
+							peerId: source,
+						});
+					});
+					break;
+				case "failed":
+					console.log("ice connection failed");
+					break;
+				case "closed":
+					console.log("ice connection closed");
+					break;
+				default:
+					break;
 			}
 		};
 
@@ -82,17 +103,18 @@ export class Socket extends RootSocket {
 					target: source,
 					data: event.candidate,
 				};
+				console.log(payload);
 
 				this.emit("#candidate", payload);
 			}
 		};
-
-		this.listeners("stream").forEach((listener) => {
-			listener({
-				streamerId: source,
-				mediaStream: peer.mediaStream,
-			});
-		});
+		peer.connection.addEventListener(
+			"signalingstatechange",
+			(ev) => {
+				peer.signalState = peer.connection.signalingState;
+			},
+			false,
+		);
 
 		return peer;
 	};
@@ -101,11 +123,21 @@ export class Socket extends RootSocket {
 		if (!this.connected) return;
 
 		if (this.localStream) {
-			throw new Error("Stream already exists");
-			//TODO: new stream can override the existing one
+			this.localStream.getTracks().forEach((track) => track.stop());
 		}
 
 		this.localStream = stream;
+
+		Object.values(this.rtcpeers).forEach(async (peer) => {
+			this._stream(peer);
+			if (this.localStream) {
+				await this.createOffer({
+					source: peer.socketId,
+					target: this.id!,
+					data: null,
+				});
+			}
+		});
 	};
 
 	private _stream = (peer: RTCPeer) => {
@@ -155,7 +187,9 @@ export class Socket extends RootSocket {
 	}
 
 	createOffer = async (payload: MessagePayload<null>) => {
-		const peerConnection = this.createPeerConnection(payload)?.connection;
+		let peerConnection = this.rtcpeers[payload.source]?.connection;
+		peerConnection =
+			peerConnection || this.createPeerConnection(payload)?.connection;
 		if (!peerConnection) return;
 
 		let offer = await peerConnection.createOffer();
@@ -166,7 +200,6 @@ export class Socket extends RootSocket {
 			target: payload.source,
 			data: offer,
 		};
-
 		this.emit("#offer", _payload);
 	};
 
@@ -174,12 +207,20 @@ export class Socket extends RootSocket {
 		const peerConnection = this.getPeer(payload.source)?.connection;
 		if (!peerConnection) return;
 
-		await peerConnection
-			.addIceCandidate(payload.data)
-			.then(() => {})
-			.catch((error) => {
-				console.error("Error adding ICE candidate:", error);
-			});
+		console.log("adding ice candidate");
+		console.log(payload);
+		if (payload.data && payload.source != this.id) {
+			await peerConnection
+				.addIceCandidate(payload.data)
+				.then(() => {
+					console.log("ICE candidate added successfully");
+				})
+				.catch((e) => {
+					console.error("Error adding received ICE candidate", e);
+				});
+		} else {
+			console.warn("Empty ICE candidate received");
+		}
 	}
 
 	async addAnswer(payload: MessagePayload<RTCSessionDescriptionInit>) {
@@ -192,9 +233,12 @@ export class Socket extends RootSocket {
 	}
 
 	async createAnswer(payload: MessagePayload<RTCSessionDescriptionInit>) {
-		const peer = this.createPeerConnection(payload);
+		let peer = this.rtcpeers[payload.source];
+
+		peer = peer || this.createPeerConnection(payload);
 
 		if (!peer?.connection) return;
+
 		await peer?.connection.setRemoteDescription(payload.data);
 
 		let answer = await peer.connection.createAnswer();
