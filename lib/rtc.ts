@@ -17,14 +17,12 @@ type RTCPeer = {
 
 type WHIPPeer = {
 	mediaStream: MediaStream;
-	connection: RTCPeerConnection
-}
-
-
+	connection: RTCPeerConnection;
+};
 
 export class Socket extends RootSocket {
 	private rtcpeers: Record<string, RTCPeer>;
-	private whippeers: Record<string, WHIPPeer>
+	private whippeers: Record<string, WHIPPeer>;
 	private localStream?: MediaStream;
 
 	private readonly servers = {
@@ -41,7 +39,7 @@ export class Socket extends RootSocket {
 	constructor(io: Manager, nsp: string, opts?: Partial<SocketOptions>) {
 		super(io, nsp, opts);
 		this.rtcpeers = {};
-		this.whippeers={};
+		this.whippeers = {};
 		this.on("#init-rtc-offer", this.createOffer);
 		this.on("#offer", this.createAnswer);
 		this.on("#answer", this.addAnswer);
@@ -62,8 +60,6 @@ export class Socket extends RootSocket {
 			socketId: source,
 		};
 
-		
-
 		const peer = this.rtcpeers[source];
 		this._stream(peer);
 
@@ -82,15 +78,15 @@ export class Socket extends RootSocket {
 				case "connected":
 					this.listeners("stream").forEach((listener) => {
 						listener({
-							streamerId: source,
-							mediaStream: peer.mediaStream,
+							id: source,
+							stream: peer.mediaStream,
 						});
 					});
 					break;
 				case "disconnected":
 					this.listeners("peer-disconnect").forEach((listener) => {
 						listener({
-							peerId: source,
+							id: source,
 						});
 					});
 					break;
@@ -117,7 +113,6 @@ export class Socket extends RootSocket {
 				this.emit("#candidate", payload);
 			}
 		};
-
 
 		return peer;
 	};
@@ -225,108 +220,112 @@ export class Socket extends RootSocket {
 			console.warn("Empty ICE candidate received");
 		}
 	}
-	 private getQueryParam(name:string | undefined="room") {
+	private getQueryParam(name: string | undefined = "room") {
 		const urlParams = new URLSearchParams(window.location.search);
-		return urlParams.get(name)||"";
-	  }
-	  
+		return urlParams.get(name) || "";
+	}
 
-	async whip(api:string,roomName:string|undefined=this.getQueryParam()){
-	
-	let pc = new RTCPeerConnection({iceServers:this.servers[0],bundlePolicy:'balanced'});
-    pc.addTransceiver('video', { 'direction': 'recvonly' });
-    pc.addTransceiver('audio', { 'direction': 'recvonly' });
-	this.whippeers[roomName] = {
-		connection: pc,
-		mediaStream: new MediaStream()
-	};
-		const offer = pc.createOffer().then(offer => {
-		pc.setLocalDescription(offer);
-	  const remoteServer=`${api}/${roomName}`
-		console.log('Local SDP:', offer.sdp);
-	  
-		fetch(remoteServer, {
-		  method: 'POST',
-		  headers: {
-			Authorization: `Bearer ${roomName}`,
-			'Content-Type': 'application/sdp'
-		  },
-		  body: offer.sdp
-		})
-		.then(response => response.json()) // Use response.text() instead of response.json()
-		.then(response => {
-		  console.log('Remote SDP:', response);
-		
-		  pc.setRemoteDescription({
-			sdp: response.answer,
-			type: 'answer'
-		  });
-		  return response;
-		})
-		.then(r => {
-		  fetch(remoteServer, {
-			method: 'PATCH',
-			headers: {
-			  Authorization: `Bearer ${roomName}`,
-			  'Content-Type': 'application/sdp'
-			},
-			body: pc.localDescription?.sdp
-		  })
-		})
-		.catch(error => {
-		  console.error('Fetch error:', error);
+	async whip(
+		api: string,
+		roomName: string | undefined = this.getQueryParam(),
+	) {
+		let pc = new RTCPeerConnection({
+			iceServers: this.servers[0],
+			bundlePolicy: "balanced",
 		});
-		
-	  })
-	  
-	  
-	  
-	  pc.addEventListener('iceconnectionstatechange', (event) => {
-		if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-		  console.log('Peer connection established.');
-		
-		  this.listeners("stream").forEach((listener) => {
-			listener({
-				streamerId: roomName,
-				mediaStream: this.whippeers[roomName]?.mediaStream,
+		pc.addTransceiver("video", { direction: "recvonly" });
+		pc.addTransceiver("audio", { direction: "recvonly" });
+		this.whippeers[roomName] = {
+			connection: pc,
+			mediaStream: new MediaStream(),
+		};
+		const offer = pc.createOffer().then((offer) => {
+			pc.setLocalDescription(offer);
+			const remoteServer = `${api}/${roomName}`;
+			console.log("Local SDP:", offer.sdp);
+
+			fetch(remoteServer, {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${roomName}`,
+					"Content-Type": "application/sdp",
+				},
+				body: offer.sdp,
+			})
+				.then((response) => response.json()) // Use response.text() instead of response.json()
+				.then((response) => {
+					console.log("Remote SDP:", response);
+
+					pc.setRemoteDescription({
+						sdp: response.answer,
+						type: "answer",
+					});
+					return response;
+				})
+				.then((r) => {
+					fetch(remoteServer, {
+						method: "PATCH",
+						headers: {
+							Authorization: `Bearer ${roomName}`,
+							"Content-Type": "application/sdp",
+						},
+						body: pc.localDescription?.sdp,
+					});
+				})
+				.catch((error) => {
+					console.error("Fetch error:", error);
+				});
+		});
+
+		pc.addEventListener("iceconnectionstatechange", (event) => {
+			if (
+				pc.iceConnectionState === "connected" ||
+				pc.iceConnectionState === "completed"
+			) {
+				console.log("Peer connection established.");
+
+				this.listeners("stream").forEach((listener) => {
+					listener({
+						id: roomName,
+						stream: this.whippeers[roomName]?.mediaStream,
+					});
+				});
+			}
+			if (pc.iceConnectionState === "failed") {
+				console.log("something failed");
+				pc.restartIce();
+			}
+			console.log("SOMETING REGARDIN ICE HAPPENED");
+			console.log(event);
+		});
+
+		pc.ontrack = (event) => {
+			console.log("event geldii");
+			console.log(event.track.kind);
+
+			event.streams[0].getTracks().forEach((track) => {
+				console.log(track);
+
+				// Log track events
+				track.onended = () => {
+					console.log("Video track ended:", track);
+					// Add any handling or cleanup logic here
+				};
+
+				track.onmute = () => {
+					console.log("Video track muted:", track);
+					// Add any handling or cleanup logic here
+				};
+
+				// Check if the track is added or removed
+				if (event.track.readyState === "ended") {
+					console.log("Video track ended:", track);
+					// Add any handling or cleanup logic here
+				} else {
+					this.whippeers[roomName].mediaStream.addTrack(track);
+				}
 			});
-		});
-		}
-		if (pc.iceConnectionState === 'failed') {
-			console.log("something failed")
-			pc.restartIce()
-		  }
-		console.log("SOMETING REGARDIN ICE HAPPENED")
-		console.log(event)
-	  });
-	  
-	  pc.ontrack = (event) => {
-		console.log("event geldii")
-		console.log(event.track.kind)
-	  
-		event.streams[0].getTracks().forEach((track) => {
-		  console.log(track)
-	  
-		  // Log track events
-		  track.onended = () => {
-			console.log('Video track ended:', track);
-			// Add any handling or cleanup logic here
-		  };
-	  
-		  track.onmute = () => {
-			console.log('Video track muted:', track);
-			// Add any handling or cleanup logic here
-		  };
-	  
-		  // Check if the track is added or removed
-		  if (event.track.readyState === 'ended') {
-			console.log('Video track ended:', track);
-			// Add any handling or cleanup logic here
-		  } else {
-			this.whippeers[roomName].mediaStream.addTrack(track);
-		  }
-		});
-	  };
+		};
 	}
 
 	async addAnswer(payload: MessagePayload<RTCSessionDescriptionInit>) {
