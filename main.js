@@ -19,47 +19,46 @@ const servers = {
     },
   ],
 };
-let pc = new RTCPeerConnection(servers);
+let pc = new RTCPeerConnection({servers, bundlePolicy:'balanced', sdpSemantics:"plan-b"});
 pc.addTransceiver('video', { 'direction': 'recvonly' });
 pc.addTransceiver('audio', { 'direction': 'recvonly' });
-
+  
 const offer = pc.createOffer().then(offer => {
   pc.setLocalDescription(offer);
 const remoteServer=`http://35.158.121.45/${roomName}`
-const localServer=`http://127.0.0.1:8080/${roomName}`
+const localServer=`http://127.0.0.1:3000/${roomName}`
   console.log('Local SDP:', offer.sdp);
 
-  fetch(remoteServer, {
-      method: 'POST',
+  fetch(localServer, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${roomName}`,
+      'Content-Type': 'application/sdp'
+    },
+    body: offer.sdp
+  })
+  .then(response => response.json()) // Use response.text() instead of response.json()
+  .then(response => {
+    console.log('Remote SDP:', response);
+  
+    pc.setRemoteDescription({
+      sdp: response.answer,
+      type: 'answer'
+    });
+    return response;
+  })
+  .then(r => {
+    fetch(localServer, {
+      method: 'PATCH',
       headers: {
         Authorization: `Bearer ${roomName}`,
         'Content-Type': 'application/sdp'
       },
-      body: offer.sdp
-  })
-  .then(response => {
-      return response.json();
-  })
-  .then(response => {
-    console.log('Remote SDP:', response.answer);
-
-      pc.setRemoteDescription({
-          sdp: response.answer,
-          type: 'answer'
-      });
-      return response;
-  }).then(r=>{
-  
-    fetch(`${r.location}`, {
-        method: 'PATCH',
-        headers: {
-            Authorization: `Bearer ${roomName}`,
-            'Content-Type': 'application/sdp'
-        },
-        body: pc.localDescription.sdp
+      body: pc.localDescription.sdp
     })
-  }).catch(error => {
-      console.error('Fetch error:', error);
+  })
+  .catch(error => {
+    console.error('Fetch error:', error);
   });
   
 })
