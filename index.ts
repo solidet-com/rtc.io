@@ -82,12 +82,4 @@ export { protocol } from "socket.io-parser";
  * @public
  */
 
-export {
-	Manager,
-	ManagerOptions,
-	Socket,
-	SocketOptions,
-	lookup as io,
-	lookup as connect,
-	lookup as default,
-};
+export { Manager, Socket, lookup as io, lookup as connect, lookup as default };

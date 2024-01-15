@@ -3,6 +3,6 @@ type BasePayload = {
 	target: string;
 };
 
-type MessagePayload<T = any> = {
+export type MessagePayload<T = any> = {
 	data: T;
 } & BasePayload;

@@ -4,7 +4,16 @@
 		"module": "commonjs",
 		"strict": true,
 		"esModuleInterop": true,
-		"noImplicitAny": false
+		"noImplicitAny": false,
+
+		"declaration": true,
+
+		"incremental": true,
+		"skipLibCheck": true,
+
+		"noImplicitThis": false,
+		"strictPropertyInitialization": false,
+		"noImplicitReturns": true
 	},
 	"include": ["lib/**/*", "index.ts"],
 	"exclude": ["node_modules"]

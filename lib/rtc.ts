@@ -4,6 +4,7 @@ import {
 } from "socket.io-client";
 import { Manager } from "./manager";
 import { getRTCStats, getRTCIceCandidateStatsReport } from "./stats/stats.js";
+import { MessagePayload } from "./payload";
 
 export interface SocketOptions extends Partial<RootSocketOptions> {
 	iceServers: RTCIceServer[];
@@ -172,13 +173,13 @@ export class Socket extends RootSocket {
 		});
 	}
 
-	async getSessionStats(peerId) {
+	async getSessionStats(peerId: string) {
 		const peerConnection = this.getPeer(peerId)?.connection;
 		if (!peerConnection) return null;
 		return await getRTCStats(peerConnection, {});
 	}
 
-	async getIceCandidateStats(peerId) {
+	async getIceCandidateStats(peerId: string) {
 		const peerConnection = this.getPeer(peerId)?.connection;
 		if (!peerConnection) return null;
 		return await getRTCIceCandidateStatsReport(peerConnection);
