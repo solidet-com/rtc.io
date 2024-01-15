@@ -230,7 +230,7 @@ export class Socket extends RootSocket {
 		roomName: string | undefined = this.getQueryParam(),
 	) {
 		let pc = new RTCPeerConnection({
-			iceServers: this.servers[0],
+			iceServers: this.servers.iceServers,
 			bundlePolicy: "balanced",
 		});
 		pc.addTransceiver("video", { direction: "recvonly" });
