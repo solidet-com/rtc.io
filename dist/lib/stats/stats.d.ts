@@ -1,7 +1,15 @@
+declare namespace _exports {
+    export { StatsOptions, RTCSample };
+}
+declare namespace _exports {
+    export { getRTCStats };
+    export { getRTCIceCandidateStatsReport };
+}
+export = _exports;
 /**
  * Used for testing to inject and extract methods.
  */
-export type StatsOptions = {
+type StatsOptions = {
     /**
      * - Method for parsing an RTCStatsReport
      */
@@ -10,7 +18,7 @@ export type StatsOptions = {
 /**
  * - A sample containing relevant WebRTC stats information.
  */
-export type RTCSample = {
+type RTCSample = {
     timestamp?: number | undefined;
     /**
      * - MimeType name of the codec being used by the outbound audio stream
@@ -40,25 +48,10 @@ export type RTCSample = {
 * @param {StatsOptions} options - List of custom options.
 * @return {Promise<RTCSample>} Universally-formatted version of RTC stats.
 */
-export function getRTCStats(peerConnection: PeerConnection, options: StatsOptions): Promise<RTCSample>;
+declare function getRTCStats(peerConnection: PeerConnection, options: StatsOptions): Promise<RTCSample>;
 /**
 * Generate WebRTC stats report containing relevant information about ICE candidates for the given {@link PeerConnection}
 * @param {PeerConnection} peerConnection - Target connection.
 * @return {Promise<RTCIceCandidateStatsReport>} RTCIceCandidateStatsReport object
 */
-export function getRTCIceCandidateStatsReport(peerConnection: PeerConnection): Promise<RTCIceCandidateStatsReport>;
-/**
-* @typedef {Object} RTCSample - A sample containing relevant WebRTC stats information.
-* @property {Number} [timestamp]
-* @property {String} [codecName] - MimeType name of the codec being used by the outbound audio stream
-* @property {Number} [rtt] - Round trip time
-* @property {Number} [jitter]
-* @property {Number} [packetsSent]
-* @property {Number} [packetsLost]
-* @property {Number} [packetsReceived]
-* @property {Number} [bytesReceived]
-* @property {Number} [bytesSent]
-* @property {Number} [localAddress]
-* @property {Number} [remoteAddress]
-*/
-export function RTCSample(): void;
+declare function getRTCIceCandidateStatsReport(peerConnection: PeerConnection): Promise<RTCIceCandidateStatsReport>;

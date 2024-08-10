@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.url = void 0;
+exports.url = url;
 const engine_io_client_1 = require("engine.io-client");
 /**
  * URL parser.
@@ -58,4 +58,3 @@ function url(uri, path = "", loc) {
             (loc && loc.port === obj.port ? "" : ":" + obj.port);
     return obj;
 }
-exports.url = url;

@@ -1,6 +1,9 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.default = exports.connect = exports.io = exports.Socket = exports.Manager = exports.protocol = void 0;
+exports.Socket = exports.Manager = exports.protocol = void 0;
+exports.io = lookup;
+exports.connect = lookup;
+exports.default = lookup;
 const url_1 = require("./lib/url");
 const rtc_1 = require("./lib/rtc");
 Object.defineProperty(exports, "Socket", { enumerable: true, get: function () { return rtc_1.Socket; } });
@@ -37,9 +40,6 @@ function lookup(uri, opts) {
     }
     return io.socket(parsed.path, opts);
 }
-exports.io = lookup;
-exports.connect = lookup;
-exports.default = lookup;
 // so that "lookup" can be used both as a function (e.g. `io(...)`) and as a
 // namespace (e.g. `io.connect(...)`), for backward compatibility
 Object.assign(lookup, {

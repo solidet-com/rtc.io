@@ -14,16 +14,19 @@ type RTCPeer = {
 	connection: RTCPeerConnection;
 	mediaStream: MediaStream;
 	socketId: string;
+	polite: boolean;
+	connectionStatus: connectionStatus;
 };
 
-type WHIPPeer = {
-	mediaStream: MediaStream;
-	connection: RTCPeerConnection;
+type connectionStatus = {
+	makingOffer: boolean;
+	ignoreOffer: boolean;
+	isSettingRemoteAnswerPending: boolean;
+	isActive: boolean;
 };
 
 export class Socket extends RootSocket {
 	private rtcpeers: Record<string, RTCPeer>;
-	private whippeers: Record<string, WHIPPeer>;
 	private localStream?: MediaStream;
 
 	private readonly servers = {
@@ -40,17 +43,123 @@ export class Socket extends RootSocket {
 	constructor(io: Manager, nsp: string, opts?: Partial<SocketOptions>) {
 		super(io, nsp, opts);
 		this.rtcpeers = {};
-		this.whippeers = {};
-		this.on("#init-rtc-offer", this.createOffer);
+		this.on("#init-rtc-offer", this.initializeConnection);
+		this.on("#rtc-message", this.handleCallServiceMessage);
+		/*
 		this.on("#offer", this.createAnswer);
 		this.on("#answer", this.addAnswer);
 		this.on("#candidate", this.addIceCandidate);
+        */
 	}
 
 	getPeer(id: string) {
 		return this.rtcpeers[id];
 	}
+	async handleCallServiceMessage(payload: MessagePayload) {
+		
+		const { source } = payload;
+		let peer = this.getPeer(source);
+		if(!peer) peer = this.initializeConnection(payload);
+		console.log("== peer ==", peer);
+		const { description, candidate } = payload.data;
+			if (description) {
+				const readyForOffer =
+					!peer.connectionStatus.makingOffer &&
+					(peer.connection.signalingState === "stable" ||
+						peer.connectionStatus.isSettingRemoteAnswerPending);
 
+				const offerCollision =
+					description.type === "offer" && !readyForOffer;
+
+				peer.connectionStatus.ignoreOffer =
+					!peer.polite && offerCollision;
+
+				if (peer.connectionStatus.ignoreOffer) return;
+
+				peer.connectionStatus.isSettingRemoteAnswerPending =
+					description.type === "answer";
+
+				if (offerCollision) {
+					await Promise.all([
+						peer.connection.setLocalDescription({
+							type: "rollback",
+						}),
+						peer.connection.setRemoteDescription(description),
+					]);
+				} else {
+					await peer.connection.setRemoteDescription(description);
+				}
+
+				peer.connectionStatus.isSettingRemoteAnswerPending = false;
+
+				if (description.type === "offer") {
+					const answer = await peer.connection.createAnswer();
+
+					await peer.connection.setLocalDescription(answer);
+
+					this.emit("#rtc-message", {
+						source: this.id,
+						target: peer.socketId,
+						data: {
+							description: peer.connection.localDescription,
+						},
+					});
+					
+				}
+			} else if (candidate) {
+				try {
+					console.log("adding ice candidate", candidate);
+					console.log(typeof candidate);
+					await peer.connection.addIceCandidate(candidate);
+				} catch (error) {
+					if (!peer.connectionStatus.ignoreOffer) throw error;
+				}
+			}
+		
+	}
+	/**
+	 * Initializes the peer connection.
+	 */
+	initializeConnection(payload: MessagePayload) {
+		try {
+			const peer = this.createPeerConnection(payload);
+			if (this.localStream)
+				this.addTracksFromLocalStreamToPeerConnection(
+					peer.connection,
+					this.localStream,
+				);
+		} catch (error) {
+			// eslint-disable-next-line no-console
+			console.error(error);
+		}
+		finally{
+			return this.getPeer(payload.source);
+		}
+	}
+
+	/**
+	 * Attaches local media tracks to peer connection.
+	 */
+	addTracksFromLocalStreamToPeerConnection(
+		peerConnection: RTCPeerConnection,
+		localStream: MediaStream,
+	) {
+		localStream.getTracks().forEach((track) => {
+			peerConnection.addTrack(track, localStream);
+		});
+	}
+
+	/**
+	 * Stop local media tracks of peer connection.
+	 */
+	stopLocalStreamTracks(localStream: MediaStream) {
+		localStream.getTracks().forEach((track) => track.stop());
+	}
+
+	/**
+	 * Creates peer connection
+	 * @returns {RTCPeerConnection} instance of RTCPeerConnection.
+	 */
 	createPeerConnection = (payload: MessagePayload): RTCPeer => {
 		const peerConnection = new RTCPeerConnection(this.servers);
 		const { source } = payload;
@@ -59,6 +168,13 @@ export class Socket extends RootSocket {
 			connection: peerConnection,
 			mediaStream: new MediaStream(),
 			socketId: source,
+			polite: true,
+			connectionStatus: {
+				makingOffer: false,
+				ignoreOffer: false,
+				isSettingRemoteAnswerPending: false,
+				isActive: true,
+			},
 		};
 
 		const peer = this.rtcpeers[source];
@@ -92,7 +208,12 @@ export class Socket extends RootSocket {
 					});
 					break;
 				case "failed":
-					console.log("ice connection failed");
+					if (peer.connection.restartIce) {
+						peer.connection.restartIce();
+					} else {
+						//restartice
+					}
+
 					break;
 				case "closed":
 					console.log("ice connection closed");
@@ -104,14 +225,47 @@ export class Socket extends RootSocket {
 
 		peer.connection.onicecandidate = async (event) => {
 			if (event.candidate) {
-				const payload: MessagePayload<RTCIceCandidate> = {
-					source: this.id,
+				const payload: MessagePayload<any> = {
+					source: this.id!,
 					target: source,
-					data: event.candidate,
+					data: {
+						candidate: event.candidate,
+					},
 				};
 				console.log(payload);
+				
+				this.emit("#rtc-message", payload);
+			}
+		};
 
-				this.emit("#candidate", payload);
+		peer.connection.onnegotiationneeded = async () => {
+			if (peer.connection.signalingState === "have-remote-offer") return;
+
+			if (peer.connectionStatus.makingOffer) {
+				return;
+			}
+
+			try {
+				peer.connectionStatus.makingOffer = true;
+
+				const offer = await peer.connection.createOffer();
+				//@ts-ignore
+				if (peer.connection.signalingState !== "have-remote-offer") {
+					await peer.connection.setLocalDescription(offer);
+
+					this.emit("#rtc-message", {
+						target: peer.socketId,
+						source: this.id,
+						data: {
+							description: peer.connection.localDescription,
+						},
+					});
+				}
+			} catch (error) {
+				// eslint-disable-next-line no-console
+				console.error(error);
+			} finally {
+				peer.connectionStatus.makingOffer = false;
 			}
 		};
 
@@ -121,21 +275,12 @@ export class Socket extends RootSocket {
 	stream = async (stream: MediaStream) => {
 		if (!this.connected) return;
 
-		if (this.localStream) {
-			this.localStream.getTracks().forEach((track) => track.stop());
-		}
+		this.localStream?.getTracks().forEach((track) => track.stop());
 
 		this.localStream = stream;
 
 		Object.values(this.rtcpeers).forEach(async (peer) => {
 			this._stream(peer);
-			if (this.localStream) {
-				await this.createOffer({
-					source: peer.socketId,
-					target: this.id!,
-					data: null,
-				});
-			}
 		});
 	};
 
@@ -185,177 +330,8 @@ export class Socket extends RootSocket {
 		return await getRTCIceCandidateStatsReport(peerConnection);
 	}
 
-	createOffer = async (payload: MessagePayload<null>) => {
-		let peerConnection = this.rtcpeers[payload.source]?.connection;
-		peerConnection =
-			peerConnection || this.createPeerConnection(payload)?.connection;
-		if (!peerConnection) return;
-
-		let offer = await peerConnection.createOffer();
-		await peerConnection.setLocalDescription(offer);
-
-		const _payload: MessagePayload<RTCSessionDescriptionInit> = {
-			source: this.id,
-			target: payload.source,
-			data: offer,
-		};
-		this.emit("#offer", _payload);
-	};
-
-	async addIceCandidate(payload: MessagePayload<RTCIceCandidate>) {
-		const peerConnection = this.getPeer(payload.source)?.connection;
-		if (!peerConnection) return;
-
-		console.log("adding ice candidate");
-		console.log(payload);
-		if (payload.data && payload.source != this.id) {
-			await peerConnection
-				.addIceCandidate(payload.data)
-				.then(() => {
-					console.log("ICE candidate added successfully");
-				})
-				.catch((e) => {
-					console.error("Error adding received ICE candidate", e);
-				});
-		} else {
-			console.warn("Empty ICE candidate received");
-		}
-	}
 	private getQueryParam(name: string | undefined = "room") {
 		const urlParams = new URLSearchParams(window.location.search);
 		return urlParams.get(name) || "";
-	}
-
-	async whip(
-		api: string,
-		roomName: string | undefined = this.getQueryParam(),
-	) {
-		let pc = new RTCPeerConnection({
-			iceServers: this.servers.iceServers,
-			bundlePolicy: "balanced",
-		});
-		pc.addTransceiver("video", { direction: "recvonly" });
-		pc.addTransceiver("audio", { direction: "recvonly" });
-		this.whippeers[roomName] = {
-			connection: pc,
-			mediaStream: new MediaStream(),
-		};
-		const offer = pc.createOffer().then((offer) => {
-			pc.setLocalDescription(offer);
-			const remoteServer = `${api}/${roomName}`;
-			console.log("Local SDP:", offer.sdp);
-
-			fetch(remoteServer, {
-				method: "POST",
-				headers: {
-					Authorization: `Bearer ${roomName}`,
-					"Content-Type": "application/sdp",
-				},
-				body: offer.sdp,
-			})
-				.then((response) => response.json()) // Use response.text() instead of response.json()
-				.then((response) => {
-					console.log("Remote SDP:", response);
-
-					pc.setRemoteDescription({
-						sdp: response.answer,
-						type: "answer",
-					});
-					return response;
-				})
-				.then((r) => {
-					fetch(remoteServer, {
-						method: "PATCH",
-						headers: {
-							Authorization: `Bearer ${roomName}`,
-							"Content-Type": "application/sdp",
-						},
-						body: pc.localDescription?.sdp,
-					});
-				})
-				.catch((error) => {
-					console.error("Fetch error:", error);
-				});
-		});
-
-		pc.addEventListener("iceconnectionstatechange", (event) => {
-			if (
-				pc.iceConnectionState === "connected" ||
-				pc.iceConnectionState === "completed"
-			) {
-				console.log("Peer connection established.");
-
-				this.listeners("stream").forEach((listener) => {
-					listener({
-						id: roomName,
-						stream: this.whippeers[roomName]?.mediaStream,
-					});
-				});
-			}
-			if (pc.iceConnectionState === "failed") {
-				console.log("something failed");
-				pc.restartIce();
-			}
-			console.log("SOMETING REGARDIN ICE HAPPENED");
-			console.log(event);
-		});
-
-		pc.ontrack = (event) => {
-			console.log("event geldii");
-			console.log(event.track.kind);
-
-			event.streams[0].getTracks().forEach((track) => {
-				console.log(track);
-
-				// Log track events
-				track.onended = () => {
-					console.log("Video track ended:", track);
-					// Add any handling or cleanup logic here
-				};
-
-				track.onmute = () => {
-					console.log("Video track muted:", track);
-					// Add any handling or cleanup logic here
-				};
-
-				// Check if the track is added or removed
-				if (event.track.readyState === "ended") {
-					console.log("Video track ended:", track);
-					// Add any handling or cleanup logic here
-				} else {
-					this.whippeers[roomName].mediaStream.addTrack(track);
-				}
-			});
-		};
-	}
-
-	async addAnswer(payload: MessagePayload<RTCSessionDescriptionInit>) {
-		const peer = this.getPeer(payload.source);
-		if (!peer) return;
-
-		if (!peer?.connection.currentRemoteDescription) {
-			peer.connection.setRemoteDescription(payload.data);
-		}
-	}
-
-	async createAnswer(payload: MessagePayload<RTCSessionDescriptionInit>) {
-		let peer = this.rtcpeers[payload.source];
-
-		peer = peer || this.createPeerConnection(payload);
-
-		if (!peer?.connection) return;
-
-		await peer?.connection.setRemoteDescription(payload.data);
-
-		let answer = await peer.connection.createAnswer();
-		await peer.connection.setLocalDescription(answer);
-
-		const _payload: MessagePayload<RTCSessionDescriptionInit> = {
-			source: this.id,
-			target: payload.source,
-			data: answer,
-		};
-
-		this.emit("#answer", _payload);
 	}
 }
