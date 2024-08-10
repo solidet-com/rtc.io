@@ -56,73 +56,74 @@ export class Socket extends RootSocket {
 		return this.rtcpeers[id];
 	}
 	async handleCallServiceMessage(payload: MessagePayload) {
-		
 		const { source } = payload;
+
 		let peer = this.getPeer(source);
-		if(!peer) peer = this.initializeConnection(payload);
+		if (!peer) peer = this.initializeConnection(payload, { polite: false });
+
 		console.log("== peer ==", peer);
 		const { description, candidate } = payload.data;
-			if (description) {
-				const readyForOffer =
-					!peer.connectionStatus.makingOffer &&
-					(peer.connection.signalingState === "stable" ||
-						peer.connectionStatus.isSettingRemoteAnswerPending);
+		if (description) {
+			const readyForOffer =
+				!peer.connectionStatus.makingOffer &&
+				(peer.connection.signalingState === "stable" ||
+					peer.connectionStatus.isSettingRemoteAnswerPending);
 
-				const offerCollision =
-					description.type === "offer" && !readyForOffer;
+			const offerCollision =
+				description.type === "offer" && !readyForOffer;
 
-				peer.connectionStatus.ignoreOffer =
-					!peer.polite && offerCollision;
+			peer.connectionStatus.ignoreOffer = !peer.polite && offerCollision;
 
-				if (peer.connectionStatus.ignoreOffer) return;
+			if (peer.connectionStatus.ignoreOffer) return;
 
-				peer.connectionStatus.isSettingRemoteAnswerPending =
-					description.type === "answer";
+			peer.connectionStatus.isSettingRemoteAnswerPending =
+				description.type === "answer";
 
-				if (offerCollision) {
-					await Promise.all([
-						peer.connection.setLocalDescription({
-							type: "rollback",
-						}),
-						peer.connection.setRemoteDescription(description),
-					]);
-				} else {
-					await peer.connection.setRemoteDescription(description);
-				}
-
-				peer.connectionStatus.isSettingRemoteAnswerPending = false;
-
-				if (description.type === "offer") {
-					const answer = await peer.connection.createAnswer();
-
-					await peer.connection.setLocalDescription(answer);
-
-					this.emit("#rtc-message", {
-						source: this.id,
-						target: peer.socketId,
-						data: {
-							description: peer.connection.localDescription,
-						},
-					});
-					
-				}
-			} else if (candidate) {
-				try {
-					console.log("adding ice candidate", candidate);
-					console.log(typeof candidate);
-					await peer.connection.addIceCandidate(candidate);
-				} catch (error) {
-					if (!peer.connectionStatus.ignoreOffer) throw error;
-				}
+			if (offerCollision) {
+				await Promise.all([
+					peer.connection.setLocalDescription({
+						type: "rollback",
+					}),
+					peer.connection.setRemoteDescription(description),
+				]);
+			} else {
+				await peer.connection.setRemoteDescription(description);
 			}
-		
+
+			peer.connectionStatus.isSettingRemoteAnswerPending = false;
+
+			if (description.type === "offer") {
+				const answer = await peer.connection.createAnswer();
+
+				await peer.connection.setLocalDescription(answer);
+
+				this.emit("#rtc-message", {
+					source: this.id,
+					target: peer.socketId,
+					data: {
+						description: peer.connection.localDescription,
+					},
+				});
+			}
+		} else if (candidate) {
+			try {
+				console.log("adding ice candidate", candidate);
+				console.log(typeof candidate);
+				await peer.connection.addIceCandidate(candidate);
+			} catch (error) {
+				if (!peer.connectionStatus.ignoreOffer) throw error;
+			}
+		}
 	}
 	/**
 	 * Initializes the peer connection.
 	 */
-	initializeConnection(payload: MessagePayload) {
+	initializeConnection(
+		payload: MessagePayload,
+		options: { polite: boolean } = { polite: true },
+	) {
 		try {
-			const peer = this.createPeerConnection(payload);
+			const peer = this.createPeerConnection(payload, options);
 			if (this.localStream)
 				this.addTracksFromLocalStreamToPeerConnection(
 					peer.connection,
@@ -131,8 +132,7 @@ export class Socket extends RootSocket {
 		} catch (error) {
 			// eslint-disable-next-line no-console
 			console.error(error);
-		}
-		finally{
+		} finally {
 			return this.getPeer(payload.source);
 		}
 	}
@@ -160,7 +160,10 @@ export class Socket extends RootSocket {
 	 * Creates peer connection
 	 * @returns {RTCPeerConnection} instance of RTCPeerConnection.
 	 */
-	createPeerConnection = (payload: MessagePayload): RTCPeer => {
+	createPeerConnection = (
+		payload: MessagePayload,
+		options: { polite: boolean },
+	): RTCPeer => {
 		const peerConnection = new RTCPeerConnection(this.servers);
 		const { source } = payload;
 
@@ -168,7 +171,7 @@ export class Socket extends RootSocket {
 			connection: peerConnection,
 			mediaStream: new MediaStream(),
 			socketId: source,
-			polite: true,
+			polite: options.polite,
 			connectionStatus: {
 				makingOffer: false,
 				ignoreOffer: false,
@@ -178,9 +181,12 @@ export class Socket extends RootSocket {
 		};
 
 		const peer = this.rtcpeers[source];
-		this._stream(peer);
 
 		peer.connection.ontrack = (event) => {
+			peer.mediaStream.getTracks().forEach((track) => {
+				peer.mediaStream.removeTrack(track);
+			});
+
 			event.streams[0].getTracks().forEach((track) => {
 				console.log(
 					"adding track to peer media stream",
@@ -232,8 +238,7 @@ export class Socket extends RootSocket {
 						candidate: event.candidate,
 					},
 				};
-				console.log(payload);
-				
+
 				this.emit("#rtc-message", payload);
 			}
 		};
@@ -272,14 +277,14 @@ export class Socket extends RootSocket {
 		return peer;
 	};
 
-	stream = async (stream: MediaStream) => {
+	stream = (stream: MediaStream) => {
 		if (!this.connected) return;
 
 		this.localStream?.getTracks().forEach((track) => track.stop());
 
 		this.localStream = stream;
 
-		Object.values(this.rtcpeers).forEach(async (peer) => {
+		Object.values(this.rtcpeers).forEach((peer) => {
 			this._stream(peer);
 		});
 	};

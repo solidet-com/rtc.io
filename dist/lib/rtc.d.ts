@@ -27,7 +27,9 @@ export declare class Socket extends RootSocket {
     /**
      * Initializes the peer connection.
      */
-    initializeConnection(payload: MessagePayload): RTCPeer;
+    initializeConnection(payload: MessagePayload, options?: {
+        polite: boolean;
+    }): RTCPeer;
     /**
      * Attaches local media tracks to peer connection.
      */
@@ -40,8 +42,10 @@ export declare class Socket extends RootSocket {
      * Creates peer connection
      * @returns {RTCPeerConnection} instance of RTCPeerConnection.
      */
-    createPeerConnection: (payload: MessagePayload) => RTCPeer;
-    stream: (stream: MediaStream) => Promise<void>;
+    createPeerConnection: (payload: MessagePayload, options: {
+        polite: boolean;
+    }) => RTCPeer;
+    stream: (stream: MediaStream) => void;
     private _stream;
     getStats(peerId: string): Promise<unknown>;
     getSessionStats(peerId: string): Promise<import("./stats/stats.js").RTCSample | null>;

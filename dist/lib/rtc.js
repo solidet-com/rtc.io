@@ -20,14 +20,14 @@ class Socket extends socket_io_client_1.Socket {
          * Creates peer connection
          * @returns {RTCPeerConnection} instance of RTCPeerConnection.
          */
-        this.createPeerConnection = (payload) => {
+        this.createPeerConnection = (payload, options) => {
             const peerConnection = new RTCPeerConnection(this.servers);
             const { source } = payload;
             this.rtcpeers[source] = {
                 connection: peerConnection,
                 mediaStream: new MediaStream(),
                 socketId: source,
-                polite: true,
+                polite: options.polite,
                 connectionStatus: {
                     makingOffer: false,
                     ignoreOffer: false,
@@ -36,8 +36,10 @@ class Socket extends socket_io_client_1.Socket {
                 },
             };
             const peer = this.rtcpeers[source];
-            this._stream(peer);
             peer.connection.ontrack = (event) => {
+                peer.mediaStream.getTracks().forEach((track) => {
+                    peer.mediaStream.removeTrack(track);
+                });
                 event.streams[0].getTracks().forEach((track) => {
                     console.log("adding track to peer media stream", peer.mediaStream);
                     peer.mediaStream.addTrack(track);
@@ -84,7 +86,6 @@ class Socket extends socket_io_client_1.Socket {
                             candidate: event.candidate,
                         },
                     };
-                    console.log(payload);
                     this.emit("#rtc-message", payload);
                 }
             };
@@ -119,13 +120,13 @@ class Socket extends socket_io_client_1.Socket {
             };
             return peer;
         };
-        this.stream = async (stream) => {
+        this.stream = (stream) => {
             var _a;
             if (!this.connected)
                 return;
             (_a = this.localStream) === null || _a === void 0 ? void 0 : _a.getTracks().forEach((track) => track.stop());
             this.localStream = stream;
-            Object.values(this.rtcpeers).forEach(async (peer) => {
+            Object.values(this.rtcpeers).forEach((peer) => {
                 this._stream(peer);
             });
         };
@@ -155,7 +156,7 @@ class Socket extends socket_io_client_1.Socket {
         const { source } = payload;
         let peer = this.getPeer(source);
         if (!peer)
-            peer = this.initializeConnection(payload);
+            peer = this.initializeConnection(payload, { polite: false });
         console.log("== peer ==", peer);
         const { description, candidate } = payload.data;
         if (description) {
@@ -163,8 +164,7 @@ class Socket extends socket_io_client_1.Socket {
                 (peer.connection.signalingState === "stable" ||
                     peer.connectionStatus.isSettingRemoteAnswerPending);
             const offerCollision = description.type === "offer" && !readyForOffer;
-            peer.connectionStatus.ignoreOffer =
-                !peer.polite && offerCollision;
+            peer.connectionStatus.ignoreOffer = !peer.polite && offerCollision;
             if (peer.connectionStatus.ignoreOffer)
                 return;
             peer.connectionStatus.isSettingRemoteAnswerPending =
@@ -208,9 +208,9 @@ class Socket extends socket_io_client_1.Socket {
     /**
      * Initializes the peer connection.
      */
-    initializeConnection(payload) {
+    initializeConnection(payload, options = { polite: true }) {
         try {
-            const peer = this.createPeerConnection(payload);
+            const peer = this.createPeerConnection(payload, options);
             if (this.localStream)
                 this.addTracksFromLocalStreamToPeerConnection(peer.connection, this.localStream);
         }

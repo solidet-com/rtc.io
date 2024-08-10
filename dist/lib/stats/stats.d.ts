@@ -13,6 +13,9 @@ type StatsOptions = {
     /**
      * - Method for parsing an RTCStatsReport
      */
+    /**
+     * - Method for parsing an RTCStatsReport
+     */
     createRTCSample?: Function | undefined;
 };
 /**
@@ -23,7 +26,13 @@ type RTCSample = {
     /**
      * - MimeType name of the codec being used by the outbound audio stream
      */
+    /**
+     * - MimeType name of the codec being used by the outbound audio stream
+     */
     codecName?: string | undefined;
+    /**
+     * - Round trip time
+     */
     /**
      * - Round trip time
      */
