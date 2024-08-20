@@ -12,10 +12,10 @@ export interface SocketOptions extends Partial<RootSocketOptions> {
 
 type RTCPeer = {
 	connection: RTCPeerConnection;
-	mediaStream: MediaStream;
 	socketId: string;
 	polite: boolean;
 	connectionStatus: connectionStatus;
+	streams: Record<string, MediaStream>;
 };
 
 type connectionStatus = {
@@ -27,7 +27,7 @@ type connectionStatus = {
 
 export class Socket extends RootSocket {
 	private rtcpeers: Record<string, RTCPeer>;
-	private localStream?: MediaStream;
+	private localStreams: Record<string, MediaStream>;
 
 	private readonly servers = {
 		iceServers: [
@@ -124,11 +124,15 @@ export class Socket extends RootSocket {
 	) {
 		try {
 			const peer = this.createPeerConnection(payload, options);
-			if (this.localStream)
-				this.addTracksFromLocalStreamToPeerConnection(
+			if (Object.keys(this.localStreams).length > 0)
+			for (const streamKey in this.localStreams){
+				const stream = this.localStreams[streamKey];
+				this.addTransceiverPeerConnection(
 					peer.connection,
-					this.localStream,
+					stream
 				);
+			}
+				
 		} catch (error) {
 			// eslint-disable-next-line no-console
 			console.error(error);
@@ -138,15 +142,26 @@ export class Socket extends RootSocket {
 	}
 
 	/**
-	 * Attaches local media tracks to peer connection.
+	 * Attaches local media transceivers to peer connection.
 	 */
-	addTracksFromLocalStreamToPeerConnection(
+	addTransceiversToPeerConnection(
 		peerConnection: RTCPeerConnection,
-		localStream: MediaStream,
+		streams: Record<string, MediaStream>
 	) {
-		localStream.getTracks().forEach((track) => {
-			peerConnection.addTrack(track, localStream);
-		});
+		for (const streamKey in streams) {
+			const stream = streams[streamKey];
+			this.addTransceiverPeerConnection(peerConnection, stream);
+		}
+	}
+
+/**
+	 * Attaches local media transceiver to peer connection.
+	 */
+	addTransceiverPeerConnection(
+		peerConnection: RTCPeerConnection,
+		stream: MediaStream
+	) {
+		peerConnection.addTransceiver("video", {direction: "sendrecv", streams: [stream]});
 	}
 
 	/**
@@ -169,7 +184,7 @@ export class Socket extends RootSocket {
 
 		this.rtcpeers[source] = {
 			connection: peerConnection,
-			mediaStream: new MediaStream(),
+			streams: {},
 			socketId: source,
 			polite: options.polite,
 			connectionStatus: {
@@ -180,21 +195,22 @@ export class Socket extends RootSocket {
 			},
 		};
 
+		//webcam transceiver,
+		//screen share transceiver
+		
+
 		const peer = this.rtcpeers[source];
 
-		peer.connection.ontrack = (event) => {
-			peer.mediaStream.getTracks().forEach((track) => {
-				peer.mediaStream.removeTrack(track);
-			});
 
-			event.streams[0].getTracks().forEach((track) => {
-				console.log(
-					"adding track to peer media stream",
-					peer.mediaStream,
-				);
-				peer.mediaStream.addTrack(track);
-			});
-		};
+			peer.connection.ontrack = ({transceiver, streams: [stream]}) => {
+				if(transceiver.mid) {
+				
+					peer.streams[transceiver.mid] = stream;
+				
+				}
+			  }
+
+
 
 		peer.connection.oniceconnectionstatechange = () => {
 			switch (peer.connection.iceConnectionState) {
@@ -202,7 +218,7 @@ export class Socket extends RootSocket {
 					this.listeners("stream").forEach((listener) => {
 						listener({
 							id: source,
-							stream: peer.mediaStream,
+							streams: peer.streams,
 						});
 					});
 					break;
@@ -280,9 +296,16 @@ export class Socket extends RootSocket {
 	stream = (stream: MediaStream) => {
 		if (!this.connected) return;
 
-		this.localStream?.getTracks().forEach((track) => track.stop());
+		const activeStream= this.localStreams[stream.id];
+		if (activeStream) {
+			this.stopLocalStreamTracks(activeStream);
+		}
 
-		this.localStream = stream;
+		this.localStreams = {
+			[stream.id]: stream,
+		};
+
+	
 
 		Object.values(this.rtcpeers).forEach((peer) => {
 			this._stream(peer);
@@ -290,12 +313,13 @@ export class Socket extends RootSocket {
 	};
 
 	private _stream = (peer: RTCPeer) => {
-		this.localStream?.getTracks().forEach((track) => {
-			if (!peer.connection) return;
-			if (!this.localStream) return;
-
-			peer.connection.addTrack(track, this.localStream);
-		});
+		for (const streamKey in this.localStreams){
+			const stream = this.localStreams[streamKey];
+			this.addTransceiverPeerConnection(
+				peer.connection,
+				stream
+			);
+		}
 	};
 
 	async getStats(peerId: string) {
