@@ -42,7 +42,10 @@ export class Socket extends RootSocket {
 
 	constructor(io: Manager, nsp: string, opts?: Partial<SocketOptions>) {
 		super(io, nsp, opts);
+
 		this.rtcpeers = {};
+		this.localStreams = {};
+
 		this.on("#init-rtc-offer", this.initializeConnection);
 		this.on("#rtc-message", this.handleCallServiceMessage);
 		/*
@@ -124,15 +127,10 @@ export class Socket extends RootSocket {
 	) {
 		try {
 			const peer = this.createPeerConnection(payload, options);
-			if (Object.keys(this.localStreams).length > 0)
-			for (const streamKey in this.localStreams){
+			for (const streamKey in this.localStreams) {
 				const stream = this.localStreams[streamKey];
-				this.addTransceiverPeerConnection(
-					peer.connection,
-					stream
-				);
+				this.addTransceiverPeerConnection(peer.connection, stream);
 			}
-				
 		} catch (error) {
 			// eslint-disable-next-line no-console
 			console.error(error);
@@ -146,7 +144,7 @@ export class Socket extends RootSocket {
 	 */
 	addTransceiversToPeerConnection(
 		peerConnection: RTCPeerConnection,
-		streams: Record<string, MediaStream>
+		streams: Record<string, MediaStream>,
 	) {
 		for (const streamKey in streams) {
 			const stream = streams[streamKey];
@@ -154,14 +152,19 @@ export class Socket extends RootSocket {
 		}
 	}
 
-/**
+	/**
 	 * Attaches local media transceiver to peer connection.
 	 */
 	addTransceiverPeerConnection(
 		peerConnection: RTCPeerConnection,
-		stream: MediaStream
+		stream: MediaStream,
 	) {
-		peerConnection.addTransceiver("video", {direction: "sendrecv", streams: [stream]});
+		stream.getTracks().forEach((track) => {
+			peerConnection.addTransceiver(track, {
+				direction: "sendrecv",
+				streams: [stream],
+			});
+		});
 	}
 
 	/**
@@ -197,31 +200,26 @@ export class Socket extends RootSocket {
 
 		//webcam transceiver,
 		//screen share transceiver
-		
 
 		const peer = this.rtcpeers[source];
 
-
-			peer.connection.ontrack = ({transceiver, streams: [stream]}) => {
-				if(transceiver.mid) {
-				
-					peer.streams[transceiver.mid] = stream;
-				
-				}
-			  }
-
-
+		peer.connection.ontrack = ({ transceiver, streams: [stream] }) => {
+			if (transceiver.mid) {
+				peer.streams[transceiver.mid] = stream;
+				this.listeners("stream").forEach((listener) => {
+					listener({
+						id: source,
+						stream: stream,
+					});
+				});
+			}
+		};
 
 		peer.connection.oniceconnectionstatechange = () => {
 			switch (peer.connection.iceConnectionState) {
-				case "connected":
-					this.listeners("stream").forEach((listener) => {
-						listener({
-							id: source,
-							streams: peer.streams,
-						});
-					});
-					break;
+				// case "connected":
+
+				// 	break;
 				case "disconnected":
 					this.listeners("peer-disconnect").forEach((listener) => {
 						listener({
@@ -296,16 +294,9 @@ export class Socket extends RootSocket {
 	stream = (stream: MediaStream) => {
 		if (!this.connected) return;
 
-		const activeStream= this.localStreams[stream.id];
-		if (activeStream) {
-			this.stopLocalStreamTracks(activeStream);
-		}
+		//TODO: stop local stream tracks if stream already exists
 
-		this.localStreams = {
-			[stream.id]: stream,
-		};
-
-	
+		this.localStreams[stream.id] = stream;
 
 		Object.values(this.rtcpeers).forEach((peer) => {
 			this._stream(peer);
@@ -313,12 +304,9 @@ export class Socket extends RootSocket {
 	};
 
 	private _stream = (peer: RTCPeer) => {
-		for (const streamKey in this.localStreams){
+		for (const streamKey in this.localStreams) {
 			const stream = this.localStreams[streamKey];
-			this.addTransceiverPeerConnection(
-				peer.connection,
-				stream
-			);
+			this.addTransceiverPeerConnection(peer.connection, stream);
 		}
 	};
 

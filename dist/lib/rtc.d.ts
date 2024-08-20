@@ -6,10 +6,10 @@ export interface SocketOptions extends Partial<RootSocketOptions> {
 }
 type RTCPeer = {
     connection: RTCPeerConnection;
-    mediaStream: MediaStream;
     socketId: string;
     polite: boolean;
     connectionStatus: connectionStatus;
+    streams: Record<string, MediaStream>;
 };
 type connectionStatus = {
     makingOffer: boolean;
@@ -19,7 +19,7 @@ type connectionStatus = {
 };
 export declare class Socket extends RootSocket {
     private rtcpeers;
-    private localStream?;
+    private localStreams;
     private readonly servers;
     constructor(io: Manager, nsp: string, opts?: Partial<SocketOptions>);
     getPeer(id: string): RTCPeer;
@@ -31,9 +31,13 @@ export declare class Socket extends RootSocket {
         polite: boolean;
     }): RTCPeer;
     /**
-     * Attaches local media tracks to peer connection.
+     * Attaches local media transceivers to peer connection.
      */
-    addTracksFromLocalStreamToPeerConnection(peerConnection: RTCPeerConnection, localStream: MediaStream): void;
+    addTransceiversToPeerConnection(peerConnection: RTCPeerConnection, streams: Record<string, MediaStream>): void;
+    /**
+     * Attaches local media transceiver to peer connection.
+     */
+    addTransceiverPeerConnection(peerConnection: RTCPeerConnection, stream: MediaStream): void;
     /**
      * Stop local media tracks of peer connection.
      */

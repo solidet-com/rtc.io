@@ -25,7 +25,7 @@ class Socket extends socket_io_client_1.Socket {
             const { source } = payload;
             this.rtcpeers[source] = {
                 connection: peerConnection,
-                mediaStream: new MediaStream(),
+                streams: {},
                 socketId: source,
                 polite: options.polite,
                 connectionStatus: {
@@ -35,26 +35,24 @@ class Socket extends socket_io_client_1.Socket {
                     isActive: true,
                 },
             };
+            //webcam transceiver,
+            //screen share transceiver
             const peer = this.rtcpeers[source];
-            peer.connection.ontrack = (event) => {
-                peer.mediaStream.getTracks().forEach((track) => {
-                    peer.mediaStream.removeTrack(track);
-                });
-                event.streams[0].getTracks().forEach((track) => {
-                    console.log("adding track to peer media stream", peer.mediaStream);
-                    peer.mediaStream.addTrack(track);
-                });
+            peer.connection.ontrack = ({ transceiver, streams: [stream] }) => {
+                if (transceiver.mid) {
+                    peer.streams[transceiver.mid] = stream;
+                    this.listeners("stream").forEach((listener) => {
+                        listener({
+                            id: source,
+                            stream: stream,
+                        });
+                    });
+                }
             };
             peer.connection.oniceconnectionstatechange = () => {
                 switch (peer.connection.iceConnectionState) {
-                    case "connected":
-                        this.listeners("stream").forEach((listener) => {
-                            listener({
-                                id: source,
-                                stream: peer.mediaStream,
-                            });
-                        });
-                        break;
+                    // case "connected":
+                    // 	break;
                     case "disconnected":
                         this.listeners("peer-disconnect").forEach((listener) => {
                             listener({
@@ -121,26 +119,29 @@ class Socket extends socket_io_client_1.Socket {
             return peer;
         };
         this.stream = (stream) => {
-            var _a;
             if (!this.connected)
                 return;
-            (_a = this.localStream) === null || _a === void 0 ? void 0 : _a.getTracks().forEach((track) => track.stop());
-            this.localStream = stream;
+            // const activeStream = this.localStreams[stream.id];
+            // if (activeStream) {
+            // 	this.stopLocalStreamTracks(activeStream);
+            // }
+            for (const streamKey in this.localStreams) {
+                const stream = this.localStreams[streamKey];
+                this.stopLocalStreamTracks(stream);
+            }
+            this.localStreams[stream.id] = stream;
             Object.values(this.rtcpeers).forEach((peer) => {
                 this._stream(peer);
             });
         };
         this._stream = (peer) => {
-            var _a;
-            (_a = this.localStream) === null || _a === void 0 ? void 0 : _a.getTracks().forEach((track) => {
-                if (!peer.connection)
-                    return;
-                if (!this.localStream)
-                    return;
-                peer.connection.addTrack(track, this.localStream);
-            });
+            for (const streamKey in this.localStreams) {
+                const stream = this.localStreams[streamKey];
+                this.addTransceiverPeerConnection(peer.connection, stream);
+            }
         };
         this.rtcpeers = {};
+        this.localStreams = {};
         this.on("#init-rtc-offer", this.initializeConnection);
         this.on("#rtc-message", this.handleCallServiceMessage);
         /*
@@ -211,8 +212,11 @@ class Socket extends socket_io_client_1.Socket {
     initializeConnection(payload, options = { polite: true }) {
         try {
             const peer = this.createPeerConnection(payload, options);
-            if (this.localStream)
-                this.addTracksFromLocalStreamToPeerConnection(peer.connection, this.localStream);
+            if (Object.keys(this.localStreams).length > 0)
+                for (const streamKey in this.localStreams) {
+                    const stream = this.localStreams[streamKey];
+                    this.addTransceiverPeerConnection(peer.connection, stream);
+                }
         }
         catch (error) {
             // eslint-disable-next-line no-console
@@ -223,11 +227,23 @@ class Socket extends socket_io_client_1.Socket {
         }
     }
     /**
-     * Attaches local media tracks to peer connection.
+     * Attaches local media transceivers to peer connection.
      */
-    addTracksFromLocalStreamToPeerConnection(peerConnection, localStream) {
-        localStream.getTracks().forEach((track) => {
-            peerConnection.addTrack(track, localStream);
+    addTransceiversToPeerConnection(peerConnection, streams) {
+        for (const streamKey in streams) {
+            const stream = streams[streamKey];
+            this.addTransceiverPeerConnection(peerConnection, stream);
+        }
+    }
+    /**
+     * Attaches local media transceiver to peer connection.
+     */
+    addTransceiverPeerConnection(peerConnection, stream) {
+        stream.getTracks().forEach((track) => {
+            peerConnection.addTransceiver(track, {
+                direction: "sendrecv",
+                streams: [stream],
+            });
         });
     }
     /**
