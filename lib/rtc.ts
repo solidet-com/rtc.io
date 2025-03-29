@@ -55,6 +55,32 @@ export class Socket extends RootSocket {
         */
 	}
 
+	emit(ev, ...args): this {
+		if (this.hasMediaStream(args)) {
+			console.log("this.emit", ev, args);
+			//TODO: implement media-stream emit
+			return this;
+		} else {
+			return super.emit(ev, ...args);
+		}
+	}
+
+	private hasMediaStream(obj: any) {
+		if (Array.isArray(obj)) {
+			return obj.some((item) => this.hasMediaStream(item));
+		} else if (obj instanceof MediaStream) {
+			return true;
+		}
+		for (const key in obj) {
+			if (typeof obj[key] === "object") {
+				if (this.hasMediaStream(obj[key])) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
 	getPeer(id: string) {
 		return this.rtcpeers[id];
 	}
