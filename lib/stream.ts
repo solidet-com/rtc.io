@@ -12,9 +12,9 @@ export class RTCIOStream {
 	) {
 		if (idOrMediaStream instanceof MediaStream) {
 			this.id = uuid();
-			this.mediaStream = mediaStream!;
+			this.mediaStream = idOrMediaStream!;
 		} else {
-			this.id = uuid();
+			this.id = idOrMediaStream;
 			this.mediaStream = mediaStream as MediaStream;
 		}
 	}

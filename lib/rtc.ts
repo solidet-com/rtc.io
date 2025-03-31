@@ -60,10 +60,26 @@ export class Socket extends RootSocket {
 	emit(ev, ...args): this {
 		const stream = this.getRTCIOStreamDeep(args);
 		if (stream) {
+			/**
+			 * const videoYayini = new RTCIOStream(mediaStream);
+			 * 
+			 * rtcio.emit('video-channel1', {streamer: 'mehmet', stream: videoYayini})
+			 * rtcio.emit('video-channel2', {streamer: 'mehmet', stream: videoYayini})
+			 * 
+			 */
+
+			// streamEvents: {
+			// 	'47983749384739(videoyayini)': {
+			// 		'video-channel': {streamer: 'mehmet', stream: 'ahmet' },
+			// 		'video-channel2': {streamer: 'mehmet', stream: 'ahmet' },
+			//  }
+			// }
+
 			console.log("this.emit", ev, args);
 			this.streamEvents[stream.id] = {
 				[ev]: args,
 			};
+
 			this.broadcastPeers(this.addTransceiverToPeer, stream);
 		} else {
 			super.emit(ev, ...args);
@@ -151,7 +167,7 @@ export class Socket extends RootSocket {
 				if (!peer.connectionStatus.ignoreOffer) throw error;
 			}
 		} else if (events) {
-			const rtcioStream = peer.streams[mid];
+			const rtcioStream = peer.streams[mid]; //id asil idden farkli.!
 
 			Object.keys(events).forEach((key) => {
 				this.listeners(key).forEach((listener) => {
@@ -270,7 +286,7 @@ export class Socket extends RootSocket {
 			if (transceiver.mid) {
 				if (peer.streams[transceiver.mid]) return;
 
-				peer.streams[transceiver.mid] = new RTCIOStream(stream);
+				peer.streams[transceiver.mid] = new RTCIOStream(stream); //idsiz, cunku henuz bilmiyoruz
 				const payload: GetEventPayload = {
 					source: this.id!,
 					target: source,
