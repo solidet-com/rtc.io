@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.Socket = void 0;
 const socket_io_client_1 = require("socket.io-client");
 const stats_js_1 = require("./stats/stats.js");
+const stream_1 = require("./stream");
 class Socket extends socket_io_client_1.Socket {
     constructor(io, nsp, opts) {
         super(io, nsp, opts);
@@ -40,13 +41,17 @@ class Socket extends socket_io_client_1.Socket {
             const peer = this.rtcpeers[source];
             peer.connection.ontrack = ({ transceiver, streams: [stream] }) => {
                 if (transceiver.mid) {
-                    peer.streams[transceiver.mid] = stream;
-                    this.listeners("stream").forEach((listener) => {
-                        listener({
-                            id: source,
-                            stream: stream,
-                        });
-                    });
+                    if (peer.streams[transceiver.mid])
+                        return;
+                    peer.streams[transceiver.mid] = new stream_1.RTCIOStream(stream);
+                    const payload = {
+                        source: this.id,
+                        target: source,
+                        data: {
+                            mid: transceiver.mid,
+                        },
+                    };
+                    this.emit("#rtc-message", payload);
                 }
             };
             peer.connection.oniceconnectionstatechange = () => {
@@ -118,30 +123,15 @@ class Socket extends socket_io_client_1.Socket {
             };
             return peer;
         };
-        this.stream = (stream) => {
+        this.broadcastPeers = (cb, ...args) => {
             if (!this.connected)
                 return;
-            // const activeStream = this.localStreams[stream.id];
-            // if (activeStream) {
-            // 	this.stopLocalStreamTracks(activeStream);
-            // }
-            for (const streamKey in this.localStreams) {
-                const stream = this.localStreams[streamKey];
-                this.stopLocalStreamTracks(stream);
-            }
-            this.localStreams[stream.id] = stream;
             Object.values(this.rtcpeers).forEach((peer) => {
-                this._stream(peer);
+                cb(peer, ...args);
             });
         };
-        this._stream = (peer) => {
-            for (const streamKey in this.localStreams) {
-                const stream = this.localStreams[streamKey];
-                this.addTransceiverPeerConnection(peer.connection, stream);
-            }
-        };
         this.rtcpeers = {};
-        this.localStreams = {};
+        this.streamEvents = {};
         this.on("#init-rtc-offer", this.initializeConnection);
         this.on("#rtc-message", this.handleCallServiceMessage);
         /*
@@ -149,6 +139,41 @@ class Socket extends socket_io_client_1.Socket {
         this.on("#answer", this.addAnswer);
         this.on("#candidate", this.addIceCandidate);
         */
+    }
+    emit(ev, ...args) {
+        const stream = this.getRTCIOStreamDeep(args);
+        if (stream) {
+            console.log("this.emit", ev, args);
+            this.streamEvents[stream.id] = {
+                [ev]: args,
+            };
+            this.broadcastPeers(this.addTransceiverToPeer, stream);
+        }
+        else {
+            super.emit(ev, ...args);
+        }
+        return this;
+    }
+    getRTCIOStreamDeep(obj) {
+        if (!obj || typeof obj !== "object")
+            return;
+        if (obj instanceof stream_1.RTCIOStream)
+            return obj;
+        if (Array.isArray(obj)) {
+            for (const item of obj) {
+                const result = this.getRTCIOStreamDeep(item);
+                if (result)
+                    return result;
+            }
+        }
+        else {
+            for (const key in obj) {
+                const result = this.getRTCIOStreamDeep(obj[key]);
+                if (result)
+                    return result;
+            }
+        }
+        return;
     }
     getPeer(id) {
         return this.rtcpeers[id];
@@ -158,8 +183,7 @@ class Socket extends socket_io_client_1.Socket {
         let peer = this.getPeer(source);
         if (!peer)
             peer = this.initializeConnection(payload, { polite: false });
-        console.log("== peer ==", peer);
-        const { description, candidate } = payload.data;
+        const { description, candidate, mid, events } = payload.data;
         if (description) {
             const readyForOffer = !peer.connectionStatus.makingOffer &&
                 (peer.connection.signalingState === "stable" ||
@@ -196,14 +220,37 @@ class Socket extends socket_io_client_1.Socket {
         }
         else if (candidate) {
             try {
-                console.log("adding ice candidate", candidate);
-                console.log(typeof candidate);
                 await peer.connection.addIceCandidate(candidate);
             }
             catch (error) {
                 if (!peer.connectionStatus.ignoreOffer)
                     throw error;
             }
+        }
+        else if (events) {
+            const rtcioStream = peer.streams[mid];
+            Object.keys(events).forEach((key) => {
+                this.listeners(key).forEach((listener) => {
+                    listener(this.deserializeStreamEvent(events[key], rtcioStream));
+                });
+            });
+        }
+        else if (mid) {
+            const rtcioStream = peer.streams[mid];
+            if (!rtcioStream)
+                throw new Error(`Transceiver with mid ${mid} not found in peer ${source}`);
+            const events = this.streamEvents[rtcioStream.id];
+            if (!events)
+                throw new Error("No events found for this stream");
+            const payload = {
+                source: this.id,
+                target: source,
+                data: {
+                    mid,
+                    events,
+                },
+            };
+            this.emit("#rtc-message", payload);
         }
     }
     /**
@@ -212,11 +259,11 @@ class Socket extends socket_io_client_1.Socket {
     initializeConnection(payload, options = { polite: true }) {
         try {
             const peer = this.createPeerConnection(payload, options);
-            if (Object.keys(this.localStreams).length > 0)
-                for (const streamKey in this.localStreams) {
-                    const stream = this.localStreams[streamKey];
-                    this.addTransceiverPeerConnection(peer.connection, stream);
-                }
+            for (const streamKey in this.streamEvents) {
+                const events = this.streamEvents[streamKey];
+                const stream = this.getRTCIOStreamDeep(events);
+                this.addTransceiverToPeer(peer, stream);
+            }
         }
         catch (error) {
             // eslint-disable-next-line no-console
@@ -226,31 +273,30 @@ class Socket extends socket_io_client_1.Socket {
             return this.getPeer(payload.source);
         }
     }
-    /**
-     * Attaches local media transceivers to peer connection.
-     */
-    addTransceiversToPeerConnection(peerConnection, streams) {
-        for (const streamKey in streams) {
-            const stream = streams[streamKey];
-            this.addTransceiverPeerConnection(peerConnection, stream);
+    deserializeStreamEvent(data, rtcioStream) {
+        if (typeof data === "string" && data.startsWith("[RTCIOStream]")) {
+            const id = data.replace("[RTCIOStream] ", "");
+            rtcioStream.id = id; // ID-Sync between peers
+            return rtcioStream;
         }
+        if (data && typeof data === "object") {
+            for (const key in data) {
+                data[key] = this.deserializeStreamEvent(data[key], rtcioStream);
+            }
+        }
+        return data;
     }
-    /**
-     * Attaches local media transceiver to peer connection.
-     */
-    addTransceiverPeerConnection(peerConnection, stream) {
-        stream.getTracks().forEach((track) => {
-            peerConnection.addTransceiver(track, {
+    addTransceiverToPeer(peer, rtcioStream) {
+        let transceiver;
+        rtcioStream.mediaStream.getTracks().forEach((track) => {
+            transceiver = peer.connection.addTransceiver(track, {
                 direction: "sendrecv",
-                streams: [stream],
+                streams: [rtcioStream.mediaStream],
             });
+            if (transceiver === null || transceiver === void 0 ? void 0 : transceiver.mid) {
+                peer.streams[transceiver.mid] = rtcioStream;
+            }
         });
-    }
-    /**
-     * Stop local media tracks of peer connection.
-     */
-    stopLocalStreamTracks(localStream) {
-        localStream.getTracks().forEach((track) => track.stop());
     }
     async getStats(peerId) {
         var _a;
@@ -285,10 +331,6 @@ class Socket extends socket_io_client_1.Socket {
         if (!peerConnection)
             return null;
         return await (0, stats_js_1.getRTCIceCandidateStatsReport)(peerConnection);
-    }
-    getQueryParam(name = "room") {
-        const urlParams = new URLSearchParams(window.location.search);
-        return urlParams.get(name) || "";
     }
 }
 exports.Socket = Socket;

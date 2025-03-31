@@ -4,7 +4,8 @@ import {
 } from "socket.io-client";
 import { Manager } from "./manager";
 import { getRTCStats, getRTCIceCandidateStatsReport } from "./stats/stats.js";
-import { MessagePayload } from "./payload";
+import { GetEventPayload, MessagePayload } from "./payload";
+import { RTCIOStream } from "./stream";
 
 export interface SocketOptions extends Partial<RootSocketOptions> {
 	iceServers: RTCIceServer[];
@@ -15,7 +16,7 @@ type RTCPeer = {
 	socketId: string;
 	polite: boolean;
 	connectionStatus: connectionStatus;
-	streams: Record<string, MediaStream>;
+	streams: Record<string, RTCIOStream>;
 };
 
 type connectionStatus = {
@@ -27,7 +28,7 @@ type connectionStatus = {
 
 export class Socket extends RootSocket {
 	private rtcpeers: Record<string, RTCPeer>;
-	private localStreams: Record<string, MediaStream>;
+	private streamEvents: Record<string, any>; // Events Payloads including RTCIOStream, stream.id:event-payload
 
 	private readonly servers = {
 		iceServers: [
@@ -44,10 +45,11 @@ export class Socket extends RootSocket {
 		super(io, nsp, opts);
 
 		this.rtcpeers = {};
-		this.localStreams = {};
+		this.streamEvents = {};
 
 		this.on("#init-rtc-offer", this.initializeConnection);
 		this.on("#rtc-message", this.handleCallServiceMessage);
+
 		/*
 		this.on("#offer", this.createAnswer);
 		this.on("#answer", this.addAnswer);
@@ -56,29 +58,38 @@ export class Socket extends RootSocket {
 	}
 
 	emit(ev, ...args): this {
-		if (this.hasMediaStream(args)) {
+		const stream = this.getRTCIOStreamDeep(args);
+		if (stream) {
 			console.log("this.emit", ev, args);
-			//TODO: implement media-stream emit
-			return this;
+			this.streamEvents[stream.id] = {
+				[ev]: args,
+			};
+			this.broadcastPeers(this.addTransceiverToPeer, stream);
 		} else {
-			return super.emit(ev, ...args);
+			super.emit(ev, ...args);
 		}
+
+		return this;
 	}
 
-	private hasMediaStream(obj: any) {
+	private getRTCIOStreamDeep(obj: any): RTCIOStream | undefined {
+		if (!obj || typeof obj !== "object") return;
+
+		if (obj instanceof RTCIOStream) return obj;
+
 		if (Array.isArray(obj)) {
-			return obj.some((item) => this.hasMediaStream(item));
-		} else if (obj instanceof MediaStream) {
-			return true;
-		}
-		for (const key in obj) {
-			if (typeof obj[key] === "object") {
-				if (this.hasMediaStream(obj[key])) {
-					return true;
-				}
+			for (const item of obj) {
+				const result = this.getRTCIOStreamDeep(item);
+				if (result) return result;
+			}
+		} else {
+			for (const key in obj) {
+				const result = this.getRTCIOStreamDeep(obj[key]);
+				if (result) return result;
 			}
 		}
-		return false;
+
+		return;
 	}
 
 	getPeer(id: string) {
@@ -90,8 +101,7 @@ export class Socket extends RootSocket {
 		let peer = this.getPeer(source);
 		if (!peer) peer = this.initializeConnection(payload, { polite: false });
 
-		console.log("== peer ==", peer);
-		const { description, candidate } = payload.data;
+		const { description, candidate, mid, events } = payload.data;
 		if (description) {
 			const readyForOffer =
 				!peer.connectionStatus.makingOffer &&
@@ -136,12 +146,40 @@ export class Socket extends RootSocket {
 			}
 		} else if (candidate) {
 			try {
-				console.log("adding ice candidate", candidate);
-				console.log(typeof candidate);
 				await peer.connection.addIceCandidate(candidate);
 			} catch (error) {
 				if (!peer.connectionStatus.ignoreOffer) throw error;
 			}
+		} else if (events) {
+			const rtcioStream = peer.streams[mid];
+
+			Object.keys(events).forEach((key) => {
+				this.listeners(key).forEach((listener) => {
+					listener(
+						this.deserializeStreamEvent(events[key], rtcioStream),
+					);
+				});
+			});
+		} else if (mid) {
+			const rtcioStream = peer.streams[mid];
+			if (!rtcioStream)
+				throw new Error(
+					`Transceiver with mid ${mid} not found in peer ${source}`,
+				);
+
+			const events = this.streamEvents[rtcioStream.id];
+			if (!events) throw new Error("No events found for this stream");
+
+			const payload: GetEventPayload = {
+				source: this.id!,
+				target: source,
+				data: {
+					mid,
+					events,
+				},
+			};
+
+			this.emit("#rtc-message", payload);
 		}
 	}
 	/**
@@ -153,9 +191,10 @@ export class Socket extends RootSocket {
 	) {
 		try {
 			const peer = this.createPeerConnection(payload, options);
-			for (const streamKey in this.localStreams) {
-				const stream = this.localStreams[streamKey];
-				this.addTransceiverPeerConnection(peer.connection, stream);
+			for (const streamKey in this.streamEvents) {
+				const events = this.streamEvents[streamKey];
+				const stream = this.getRTCIOStreamDeep(events) as RTCIOStream;
+				this.addTransceiverToPeer(peer, stream);
 			}
 		} catch (error) {
 			// eslint-disable-next-line no-console
@@ -165,39 +204,37 @@ export class Socket extends RootSocket {
 		}
 	}
 
-	/**
-	 * Attaches local media transceivers to peer connection.
-	 */
-	addTransceiversToPeerConnection(
-		peerConnection: RTCPeerConnection,
-		streams: Record<string, MediaStream>,
-	) {
-		for (const streamKey in streams) {
-			const stream = streams[streamKey];
-			this.addTransceiverPeerConnection(peerConnection, stream);
+	deserializeStreamEvent(data: any, rtcioStream: RTCIOStream) {
+		if (typeof data === "string" && data.startsWith("[RTCIOStream]")) {
+			const id = data.replace("[RTCIOStream] ", "");
+
+			rtcioStream.id = id; // ID-Sync between peers
+
+			return rtcioStream;
 		}
+
+		if (data && typeof data === "object") {
+			for (const key in data) {
+				data[key] = this.deserializeStreamEvent(data[key], rtcioStream);
+			}
+		}
+
+		return data;
 	}
 
-	/**
-	 * Attaches local media transceiver to peer connection.
-	 */
-	addTransceiverPeerConnection(
-		peerConnection: RTCPeerConnection,
-		stream: MediaStream,
-	) {
-		stream.getTracks().forEach((track) => {
-			peerConnection.addTransceiver(track, {
+	addTransceiverToPeer(peer: RTCPeer, rtcioStream: RTCIOStream) {
+		let transceiver!: RTCRtpTransceiver;
+
+		rtcioStream.mediaStream.getTracks().forEach((track) => {
+			transceiver = peer.connection.addTransceiver(track, {
 				direction: "sendrecv",
-				streams: [stream],
+				streams: [rtcioStream.mediaStream],
 			});
-		});
-	}
 
-	/**
-	 * Stop local media tracks of peer connection.
-	 */
-	stopLocalStreamTracks(localStream: MediaStream) {
-		localStream.getTracks().forEach((track) => track.stop());
+			if (transceiver?.mid) {
+				peer.streams[transceiver.mid] = rtcioStream;
+			}
+		});
 	}
 
 	/**
@@ -231,13 +268,17 @@ export class Socket extends RootSocket {
 
 		peer.connection.ontrack = ({ transceiver, streams: [stream] }) => {
 			if (transceiver.mid) {
-				peer.streams[transceiver.mid] = stream;
-				this.listeners("stream").forEach((listener) => {
-					listener({
-						id: source,
-						stream: stream,
-					});
-				});
+				if (peer.streams[transceiver.mid]) return;
+
+				peer.streams[transceiver.mid] = new RTCIOStream(stream);
+				const payload: GetEventPayload = {
+					source: this.id!,
+					target: source,
+					data: {
+						mid: transceiver.mid,
+					},
+				};
+				this.emit("#rtc-message", payload);
 			}
 		};
 
@@ -317,23 +358,12 @@ export class Socket extends RootSocket {
 		return peer;
 	};
 
-	stream = (stream: MediaStream) => {
+	private broadcastPeers = (cb: Function, ...args: any[]) => {
 		if (!this.connected) return;
 
-		//TODO: stop local stream tracks if stream already exists
-
-		this.localStreams[stream.id] = stream;
-
 		Object.values(this.rtcpeers).forEach((peer) => {
-			this._stream(peer);
+			cb(peer, ...args);
 		});
-	};
-
-	private _stream = (peer: RTCPeer) => {
-		for (const streamKey in this.localStreams) {
-			const stream = this.localStreams[streamKey];
-			this.addTransceiverPeerConnection(peer.connection, stream);
-		}
 	};
 
 	async getStats(peerId: string) {
@@ -371,10 +401,5 @@ export class Socket extends RootSocket {
 		const peerConnection = this.getPeer(peerId)?.connection;
 		if (!peerConnection) return null;
 		return await getRTCIceCandidateStatsReport(peerConnection);
-	}
-
-	private getQueryParam(name: string | undefined = "room") {
-		const urlParams = new URLSearchParams(window.location.search);
-		return urlParams.get(name) || "";
 	}
 }

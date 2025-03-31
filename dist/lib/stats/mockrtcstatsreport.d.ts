@@ -18,7 +18,7 @@ declare class MockRTCStatsReport {
      *   with a MockRTCStatsReport object.
      */
     constructor(statsMap: Map<string, RTCStats>);
-    [Symbol.iterator]: () => IterableIterator<[string, RTCStats]>;
+    [Symbol.iterator]: () => MapIterator<[string, RTCStats]>;
 }
 declare namespace MockRTCStatsReport {
     /**
