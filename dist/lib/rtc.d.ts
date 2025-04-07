@@ -33,6 +33,7 @@ export declare class Socket extends RootSocket {
     initializeConnection(payload: MessagePayload, options?: {
         polite: boolean;
     }): RTCPeer;
+    serializeStreamEvent(data: any): any;
     deserializeStreamEvent(data: any, rtcioStream: RTCIOStream): any;
     addTransceiverToPeer(peer: RTCPeer, rtcioStream: RTCIOStream): void;
     /**

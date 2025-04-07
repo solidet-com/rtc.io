@@ -6,6 +6,7 @@ import { Manager } from "./manager";
 import { getRTCStats, getRTCIceCandidateStatsReport } from "./stats/stats.js";
 import { GetEventPayload, MessagePayload } from "./payload";
 import { RTCIOStream } from "./stream";
+import { json } from "stream/consumers";
 
 export interface SocketOptions extends Partial<RootSocketOptions> {
 	iceServers: RTCIceServer[];
@@ -62,10 +63,10 @@ export class Socket extends RootSocket {
 		if (stream) {
 			/**
 			 * const videoYayini = new RTCIOStream(mediaStream);
-			 * 
+			 *
 			 * rtcio.emit('video-channel1', {streamer: 'mehmet', stream: videoYayini})
 			 * rtcio.emit('video-channel2', {streamer: 'mehmet', stream: videoYayini})
-			 * 
+			 *
 			 */
 
 			// streamEvents: {
@@ -169,11 +170,16 @@ export class Socket extends RootSocket {
 		} else if (events) {
 			const rtcioStream = peer.streams[mid]; //id asil idden farkli.!
 
+			console.log("received events", events);
+
 			Object.keys(events).forEach((key) => {
 				this.listeners(key).forEach((listener) => {
-					listener(
-						this.deserializeStreamEvent(events[key], rtcioStream),
-					);
+					const subEvents = events[key];
+					subEvents.forEach((subEvent) => {
+						listener(
+							this.deserializeStreamEvent(subEvent, rtcioStream),
+						);
+					});
 				});
 			});
 		} else if (mid) {
@@ -186,13 +192,15 @@ export class Socket extends RootSocket {
 			const events = this.streamEvents[rtcioStream.id];
 			if (!events) throw new Error("No events found for this stream");
 
+			console.log(this.serializeStreamEvent(events));
+
 			const payload: GetEventPayload = {
 				source: this.id!,
-				target: source,
-				data: {
+				target: peer.socketId,
+				data: this.serializeStreamEvent({
 					mid,
 					events,
-				},
+				}),
 			};
 
 			this.emit("#rtc-message", payload);
@@ -220,19 +228,52 @@ export class Socket extends RootSocket {
 		}
 	}
 
+	serializeStreamEvent(data) {
+		if (data instanceof RTCIOStream) {
+			return data.toJSON();
+		}
+		try {
+			if (data && typeof data === "object") {
+				for (const key in data) {
+					data[key] = this.serializeStreamEvent(data[key]);
+				}
+			}
+		} catch (err) {
+			console.error(data);
+		}
+
+		return data;
+	}
+
 	deserializeStreamEvent(data: any, rtcioStream: RTCIOStream) {
 		if (typeof data === "string" && data.startsWith("[RTCIOStream]")) {
 			const id = data.replace("[RTCIOStream] ", "");
 
+			console.log("---- ID -- SYNC ----");
+			console.log(rtcioStream.id);
 			rtcioStream.id = id; // ID-Sync between peers
+			console.log(rtcioStream.id);
+			console.log("---- ID -- SYNC-END ----");
 
 			return rtcioStream;
 		}
 
-		if (data && typeof data === "object") {
-			for (const key in data) {
-				data[key] = this.deserializeStreamEvent(data[key], rtcioStream);
+		if (data instanceof RTCIOStream) {
+			return data;
+		}
+
+		try {
+			if (data && typeof data === "object") {
+				for (const key in data) {
+					data[key] = this.deserializeStreamEvent(
+						data[key],
+						rtcioStream,
+					);
+				}
+				//media streamin'id sini looplayacak konuma geliyor
 			}
+		} catch (err) {
+			console.error(data);
 		}
 
 		return data;
@@ -247,9 +288,17 @@ export class Socket extends RootSocket {
 				streams: [rtcioStream.mediaStream],
 			});
 
-			if (transceiver?.mid) {
-				peer.streams[transceiver.mid] = rtcioStream;
-			}
+			// console.log(
+			// 	`Sending Track: \n
+			// 	MID: ${transceiver.mid}\n
+			// 	Track ID: ${transceiver.receiver.track.id}\n
+			// 	Track Label:${transceiver.receiver.track.label}
+			// 	Track Kind: ${transceiver.receiver.track.kind}\n
+			// 	Stream ID: ${rtcioStream.mediaStream.id}\n
+			// 	`,
+			// );
+
+			peer.streams[rtcioStream.mediaStream.id] = rtcioStream;
 		});
 	}
 
@@ -284,14 +333,23 @@ export class Socket extends RootSocket {
 
 		peer.connection.ontrack = ({ transceiver, streams: [stream] }) => {
 			if (transceiver.mid) {
-				if (peer.streams[transceiver.mid]) return;
+				// console.log(
+				// 	`New Track: \n
+				// 	MID: ${transceiver.mid}\n
+				// 	Track ID: ${transceiver.receiver.track.id}\n
+				// 	Track Label:${transceiver.receiver.track.label}
+				// 	Track Kind: ${transceiver.receiver.track.kind}\n
+				// 	Stream ID: ${stream.id}\n
+				// 	`,
+				// );
+				if (peer.streams[stream.id]) return;
 
-				peer.streams[transceiver.mid] = new RTCIOStream(stream); //idsiz, cunku henuz bilmiyoruz
+				peer.streams[stream.id] = new RTCIOStream(stream); //idsiz, cunku henuz bilmiyoruz
 				const payload: GetEventPayload = {
 					source: this.id!,
 					target: source,
 					data: {
-						mid: transceiver.mid,
+						mid: stream.id,
 					},
 				};
 				this.emit("#rtc-message", payload);

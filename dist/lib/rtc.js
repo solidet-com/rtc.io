@@ -41,14 +41,23 @@ class Socket extends socket_io_client_1.Socket {
             const peer = this.rtcpeers[source];
             peer.connection.ontrack = ({ transceiver, streams: [stream] }) => {
                 if (transceiver.mid) {
-                    if (peer.streams[transceiver.mid])
+                    // console.log(
+                    // 	`New Track: \n
+                    // 	MID: ${transceiver.mid}\n
+                    // 	Track ID: ${transceiver.receiver.track.id}\n
+                    // 	Track Label:${transceiver.receiver.track.label}
+                    // 	Track Kind: ${transceiver.receiver.track.kind}\n
+                    // 	Stream ID: ${stream.id}\n
+                    // 	`,
+                    // );
+                    if (peer.streams[stream.id])
                         return;
-                    peer.streams[transceiver.mid] = new stream_1.RTCIOStream(stream);
+                    peer.streams[stream.id] = new stream_1.RTCIOStream(stream); //idsiz, cunku henuz bilmiyoruz
                     const payload = {
                         source: this.id,
                         target: source,
                         data: {
-                            mid: transceiver.mid,
+                            mid: stream.id,
                         },
                     };
                     this.emit("#rtc-message", payload);
@@ -143,6 +152,19 @@ class Socket extends socket_io_client_1.Socket {
     emit(ev, ...args) {
         const stream = this.getRTCIOStreamDeep(args);
         if (stream) {
+            /**
+             * const videoYayini = new RTCIOStream(mediaStream);
+             *
+             * rtcio.emit('video-channel1', {streamer: 'mehmet', stream: videoYayini})
+             * rtcio.emit('video-channel2', {streamer: 'mehmet', stream: videoYayini})
+             *
+             */
+            // streamEvents: {
+            // 	'47983749384739(videoyayini)': {
+            // 		'video-channel': {streamer: 'mehmet', stream: 'ahmet' },
+            // 		'video-channel2': {streamer: 'mehmet', stream: 'ahmet' },
+            //  }
+            // }
             console.log("this.emit", ev, args);
             this.streamEvents[stream.id] = {
                 [ev]: args,
@@ -228,10 +250,14 @@ class Socket extends socket_io_client_1.Socket {
             }
         }
         else if (events) {
-            const rtcioStream = peer.streams[mid];
+            const rtcioStream = peer.streams[mid]; //id asil idden farkli.!
+            console.log("received events", events);
             Object.keys(events).forEach((key) => {
                 this.listeners(key).forEach((listener) => {
-                    listener(this.deserializeStreamEvent(events[key], rtcioStream));
+                    const subEvents = events[key];
+                    subEvents.forEach((subEvent) => {
+                        listener(this.deserializeStreamEvent(subEvent, rtcioStream));
+                    });
                 });
             });
         }
@@ -242,13 +268,14 @@ class Socket extends socket_io_client_1.Socket {
             const events = this.streamEvents[rtcioStream.id];
             if (!events)
                 throw new Error("No events found for this stream");
+            console.log(this.serializeStreamEvent(events));
             const payload = {
                 source: this.id,
-                target: source,
-                data: {
+                target: peer.socketId,
+                data: this.serializeStreamEvent({
                     mid,
                     events,
-                },
+                }),
             };
             this.emit("#rtc-message", payload);
         }
@@ -273,16 +300,45 @@ class Socket extends socket_io_client_1.Socket {
             return this.getPeer(payload.source);
         }
     }
+    serializeStreamEvent(data) {
+        if (data instanceof stream_1.RTCIOStream) {
+            return data.toJSON();
+        }
+        try {
+            if (data && typeof data === "object") {
+                for (const key in data) {
+                    data[key] = this.serializeStreamEvent(data[key]);
+                }
+            }
+        }
+        catch (err) {
+            console.error(data);
+        }
+        return data;
+    }
     deserializeStreamEvent(data, rtcioStream) {
         if (typeof data === "string" && data.startsWith("[RTCIOStream]")) {
             const id = data.replace("[RTCIOStream] ", "");
+            console.log("---- ID -- SYNC ----");
+            console.log(rtcioStream.id);
             rtcioStream.id = id; // ID-Sync between peers
+            console.log(rtcioStream.id);
+            console.log("---- ID -- SYNC-END ----");
             return rtcioStream;
         }
-        if (data && typeof data === "object") {
-            for (const key in data) {
-                data[key] = this.deserializeStreamEvent(data[key], rtcioStream);
+        if (data instanceof stream_1.RTCIOStream) {
+            return data;
+        }
+        try {
+            if (data && typeof data === "object") {
+                for (const key in data) {
+                    data[key] = this.deserializeStreamEvent(data[key], rtcioStream);
+                }
+                //media streamin'id sini looplayacak konuma geliyor
             }
+        }
+        catch (err) {
+            console.error(data);
         }
         return data;
     }
@@ -293,9 +349,16 @@ class Socket extends socket_io_client_1.Socket {
                 direction: "sendrecv",
                 streams: [rtcioStream.mediaStream],
             });
-            if (transceiver === null || transceiver === void 0 ? void 0 : transceiver.mid) {
-                peer.streams[transceiver.mid] = rtcioStream;
-            }
+            // console.log(
+            // 	`Sending Track: \n
+            // 	MID: ${transceiver.mid}\n
+            // 	Track ID: ${transceiver.receiver.track.id}\n
+            // 	Track Label:${transceiver.receiver.track.label}
+            // 	Track Kind: ${transceiver.receiver.track.kind}\n
+            // 	Stream ID: ${rtcioStream.mediaStream.id}\n
+            // 	`,
+            // );
+            peer.streams[rtcioStream.mediaStream.id] = rtcioStream;
         });
     }
     async getStats(peerId) {
