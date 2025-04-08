@@ -215,10 +215,16 @@ export class Socket extends RootSocket {
 	) {
 		try {
 			const peer = this.createPeerConnection(payload, options);
-			for (const streamKey in this.streamEvents) {
-				const events = this.streamEvents[streamKey];
-				const stream = this.getRTCIOStreamDeep(events) as RTCIOStream;
-				this.addTransceiverToPeer(peer, stream);
+			//  add transceivers if there are streams 
+			if (Object.keys(this.streamEvents).length > 0) {
+				for (const streamKey in this.streamEvents) {
+					const events = this.streamEvents[streamKey];
+					const stream = this.getRTCIOStreamDeep(events) as RTCIOStream;
+					if (stream) {
+						// always add the stream to the peer even if it has no tracks
+						this.addTransceiverToPeer(peer, stream);
+					}
+				}
 			}
 		} catch (error) {
 			// eslint-disable-next-line no-console
@@ -282,11 +288,21 @@ export class Socket extends RootSocket {
 	addTransceiverToPeer(peer: RTCPeer, rtcioStream: RTCIOStream) {
 		let transceiver!: RTCRtpTransceiver;
 
-		rtcioStream.mediaStream.getTracks().forEach((track) => {
-			transceiver = peer.connection.addTransceiver(track, {
-				direction: "sendrecv",
-				streams: [rtcioStream.mediaStream],
-			});
+		const tracks = rtcioStream.mediaStream.getTracks();
+		if (tracks.length === 0) {
+			// if no tracks, just store the streamref without any track/transceiver so when 
+			// user adds audio or cam just append
+			peer.streams[rtcioStream.mediaStream.id] = rtcioStream;
+			return;
+		}
+
+		tracks.forEach((track) => {
+			//  iff user has sent a audio or video stream
+			if (track.kind === 'audio' || track.kind === 'video') {
+				transceiver = peer.connection.addTransceiver(track, {
+					direction: "sendrecv",
+					streams: [rtcioStream.mediaStream],
+				});
 
 			// console.log(
 			// 	`Sending Track: \n
@@ -298,7 +314,8 @@ export class Socket extends RootSocket {
 			// 	`,
 			// );
 
-			peer.streams[rtcioStream.mediaStream.id] = rtcioStream;
+				peer.streams[rtcioStream.mediaStream.id] = rtcioStream;
+			}
 		});
 	}
 
