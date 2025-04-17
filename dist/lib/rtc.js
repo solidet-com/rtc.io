@@ -278,15 +278,15 @@ class Socket extends socket_io_client_1.Socket {
             if (!rtcioStream)
                 throw new Error(`Transceiver with mid ${mid} not found in peer ${source}`);
             const events = this.streamEvents[rtcioStream.id];
-            if (!events)
-                throw new Error("No events found for this stream");
-            console.log(this.serializeStreamEvent(events));
+            if (!events) {
+                this.streamEvents[rtcioStream.id] = {};
+            }
             const payload = {
                 source: this.id,
                 target: peer.socketId,
                 data: this.serializeStreamEvent({
                     mid,
-                    events,
+                    events: this.streamEvents[rtcioStream.id],
                 }),
             };
             this.emit("#rtc-message", payload);
@@ -311,6 +311,8 @@ class Socket extends socket_io_client_1.Socket {
                     }
                 }
             }
+            // Broadcast existing streams to the new peer
+            this.broadcastExistingStreams(peer);
         }
         catch (error) {
             // eslint-disable-next-line no-console
@@ -319,6 +321,22 @@ class Socket extends socket_io_client_1.Socket {
         finally {
             return this.getPeer(payload.source);
         }
+    }
+    broadcastExistingStreams(newPeer) {
+        // Get all existing peers except the new one
+        const existingPeers = Object.values(this.rtcpeers).filter(p => p.socketId !== newPeer.socketId);
+        // For each existing peer, share their streams with the new peer
+        existingPeers.forEach(existingPeer => {
+            Object.values(existingPeer.streams).forEach(stream => {
+                if (stream.mediaStream) {
+                    // Add the stream to streamEvents if it doesn't exist
+                    if (!this.streamEvents[stream.id]) {
+                        this.streamEvents[stream.id] = {};
+                    }
+                    this.addTransceiverToPeer(newPeer, stream);
+                }
+            });
+        });
     }
     serializeStreamEvent(data) {
         if (data instanceof stream_1.RTCIOStream) {

@@ -189,16 +189,16 @@ export class Socket extends RootSocket {
 				);
 
 			const events = this.streamEvents[rtcioStream.id];
-			if (!events) throw new Error("No events found for this stream");
-
-			console.log(this.serializeStreamEvent(events));
+			if (!events) {
+				this.streamEvents[rtcioStream.id] = {};
+			}
 
 			const payload: GetEventPayload = {
 				source: this.id!,
 				target: peer.socketId,
 				data: this.serializeStreamEvent({
 					mid,
-					events,
+					events: this.streamEvents[rtcioStream.id],
 				}),
 			};
 
@@ -229,12 +229,33 @@ export class Socket extends RootSocket {
 					}
 				}
 			}
+
+			// Broadcast existing streams to the new peer
+			this.broadcastExistingStreams(peer);
 		} catch (error) {
 			// eslint-disable-next-line no-console
 			console.error(error);
 		} finally {
 			return this.getPeer(payload.source);
 		}
+	}
+
+	private broadcastExistingStreams(newPeer: RTCPeer) {
+		// Get all existing peers except the new one
+		const existingPeers = Object.values(this.rtcpeers).filter(p => p.socketId !== newPeer.socketId);
+		
+		// For each existing peer, share their streams with the new peer
+		existingPeers.forEach(existingPeer => {
+			Object.values(existingPeer.streams).forEach(stream => {
+				if (stream.mediaStream) {
+					// Add the stream to streamEvents if it doesn't exist
+					if (!this.streamEvents[stream.id]) {
+						this.streamEvents[stream.id] = {};
+					}
+					this.addTransceiverToPeer(newPeer, stream);
+				}
+			});
+		});
 	}
 
 	serializeStreamEvent(data) {
