@@ -6,7 +6,6 @@ import { Manager } from "./manager";
 import { getRTCStats, getRTCIceCandidateStatsReport } from "./stats/stats.js";
 import { GetEventPayload, MessagePayload } from "./payload";
 import { RTCIOStream } from "./stream";
-import { json } from "stream/consumers";
 
 export interface SocketOptions extends Partial<RootSocketOptions> {
 	iceServers: RTCIceServer[];

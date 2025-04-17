@@ -1,6 +1,7 @@
 import { url } from "./lib/url";
 import { SocketOptions, Socket } from "./lib/rtc";
 import { Manager, ManagerOptions } from "./lib/manager";
+import { RTCIOStream } from "./lib/stream";
 
 /**
  * Managers cache.
@@ -82,4 +83,11 @@ export { protocol } from "socket.io-parser";
  * @public
  */
 
-export { Manager, Socket, lookup as io, lookup as connect, lookup as default };
+export {
+	RTCIOStream,
+	Manager,
+	Socket,
+	lookup as io,
+	lookup as connect,
+	lookup as default,
+};
