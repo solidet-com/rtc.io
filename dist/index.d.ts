@@ -1,5 +1,6 @@
 import { SocketOptions, Socket } from "./lib/rtc";
 import { Manager, ManagerOptions } from "./lib/manager";
+import { RTCIOStream } from "./lib/stream";
 /**
  * Looks up an existing `Manager` for multiplexing.
  * If the user summons:
@@ -25,4 +26,4 @@ export { protocol } from "socket.io-parser";
  *
  * @public
  */
-export { Manager, Socket, lookup as io, lookup as connect, lookup as default };
+export { RTCIOStream, Manager, Socket, lookup as io, lookup as connect, lookup as default, };
