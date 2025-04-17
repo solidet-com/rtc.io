@@ -214,10 +214,20 @@ export class Socket extends RootSocket {
 	) {
 		try {
 			const peer = this.createPeerConnection(payload, options);
-			for (const streamKey in this.streamEvents) {
-				const events = this.streamEvents[streamKey];
-				const stream = this.getRTCIOStreamDeep(events) as RTCIOStream;
-				this.addTransceiverToPeer(peer, stream);
+			
+			//  data channel to connect with even without media
+			peer.connection.createDataChannel("connectionSetup");
+			
+			//  add transceivers if there are streams 
+			if (Object.keys(this.streamEvents).length > 0) {
+				for (const streamKey in this.streamEvents) {
+					const events = this.streamEvents[streamKey];
+					const stream = this.getRTCIOStreamDeep(events) as RTCIOStream;
+					if (stream) {
+						// always add the stream to the peer even if it has no tracks
+						this.addTransceiverToPeer(peer, stream);
+					}
+				}
 			}
 		} catch (error) {
 			// eslint-disable-next-line no-console
@@ -281,23 +291,54 @@ export class Socket extends RootSocket {
 	addTransceiverToPeer(peer: RTCPeer, rtcioStream: RTCIOStream) {
 		let transceiver!: RTCRtpTransceiver;
 
-		rtcioStream.mediaStream.getTracks().forEach((track) => {
-			transceiver = peer.connection.addTransceiver(track, {
-				direction: "sendrecv",
-				streams: [rtcioStream.mediaStream],
+		// Store the stream reference even if it has no tracks
+		peer.streams[rtcioStream.mediaStream.id] = rtcioStream;
+		
+		rtcioStream.onTrackChanged((stream) => {
+			const tracks = stream.getTracks();
+			tracks.forEach(track => {
+				const existingTransceiver = Array.from(peer.connection.getTransceivers()).find(
+					t => t.sender.track && t.sender.track.kind === track.kind
+				);
+				
+				if (existingTransceiver) {
+					existingTransceiver.sender.replaceTrack(track);
+				} else {
+					peer.connection.addTransceiver(track, {
+						direction: "sendrecv",
+						streams: [rtcioStream.mediaStream],
+					});
+				}
 			});
+			
+			// Force negotiation if needed
+			if (peer.connection.signalingState === "stable") {
+				peer.connection.dispatchEvent(new Event('negotiationneeded'));
+			}
+		});
 
-			// console.log(
-			// 	`Sending Track: \n
-			// 	MID: ${transceiver.mid}\n
-			// 	Track ID: ${transceiver.receiver.track.id}\n
-			// 	Track Label:${transceiver.receiver.track.label}
-			// 	Track Kind: ${transceiver.receiver.track.kind}\n
-			// 	Stream ID: ${rtcioStream.mediaStream.id}\n
-			// 	`,
-			// );
+		const tracks = rtcioStream.mediaStream.getTracks();
+		if (tracks.length === 0) {
+			transceiver = peer.connection.addTransceiver('audio', {
+				direction: "sendrecv"
+			});
+			
+			if (peer.connection.signalingState === "stable") {
+				peer.connection.dispatchEvent(new Event('negotiationneeded'));
+			}
+			return;
+		}
 
-			peer.streams[rtcioStream.mediaStream.id] = rtcioStream;
+		tracks.forEach((track) => {
+			//  if user has sent an audio or video stream
+			if (track.kind === 'audio' || track.kind === 'video') {
+				transceiver = peer.connection.addTransceiver(track, {
+					direction: "sendrecv",
+					streams: [rtcioStream.mediaStream],
+				});
+
+				peer.streams[rtcioStream.mediaStream.id] = rtcioStream;
+			}
 		});
 	}
 
@@ -332,18 +373,35 @@ export class Socket extends RootSocket {
 
 		peer.connection.ontrack = ({ transceiver, streams: [stream] }) => {
 			if (transceiver.mid) {
-				// console.log(
-				// 	`New Track: \n
-				// 	MID: ${transceiver.mid}\n
-				// 	Track ID: ${transceiver.receiver.track.id}\n
-				// 	Track Label:${transceiver.receiver.track.label}
-				// 	Track Kind: ${transceiver.receiver.track.kind}\n
-				// 	Stream ID: ${stream.id}\n
-				// 	`,
-				// );
-				if (peer.streams[stream.id]) return;
+				// If we already have this stream, we need to update it with the new track
+				if (peer.streams[stream.id]) {
+					// Check if the track is already in the stream
+					const existingTrack = peer.streams[stream.id].mediaStream.getTracks().find(
+						t => t.kind === transceiver.receiver.track.kind
+					);
+					
+					if (!existingTrack) {
+						// Add the new track to the existing stream
+						peer.streams[stream.id].mediaStream.addTrack(transceiver.receiver.track);
+					} else {
+						// Replace the existing track with the new one
+						peer.streams[stream.id].mediaStream.removeTrack(existingTrack);
+						peer.streams[stream.id].mediaStream.addTrack(transceiver.receiver.track);
+					}
+					
+					// Notify about track addition
+					this.listeners("track-added").forEach((listener) => {
+						listener({
+							peerId: source,
+							stream: peer.streams[stream.id].mediaStream,
+							track: transceiver.receiver.track
+						});
+					});
+					
+					return;
+				}
 
-				peer.streams[stream.id] = new RTCIOStream(stream); //idsiz, cunku henuz bilmiyoruz
+				peer.streams[stream.id] = new RTCIOStream(stream);
 				const payload: GetEventPayload = {
 					source: this.id!,
 					target: source,
