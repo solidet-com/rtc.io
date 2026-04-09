@@ -7,73 +7,80 @@ import { getRTCStats, getRTCIceCandidateStatsReport } from "./stats/stats.js";
 import { MessagePayload } from "./payload";
 
 export interface SocketOptions extends Partial<RootSocketOptions> {
-	iceServers: RTCIceServer[];
+	iceServers?: RTCIceServer[];
 }
 
 type RTCPeer = {
 	connection: RTCPeerConnection;
 	socketId: string;
 	polite: boolean;
-	connectionStatus: connectionStatus;
+	connectionStatus: ConnectionStatus;
 	streams: Record<string, MediaStream>;
+	emittedStreamIds: Set<string>;
 };
 
-type connectionStatus = {
+type ConnectionStatus = {
 	makingOffer: boolean;
 	ignoreOffer: boolean;
 	isSettingRemoteAnswerPending: boolean;
-	isActive: boolean;
 };
 
 export class Socket extends RootSocket {
 	private rtcpeers: Record<string, RTCPeer>;
-	private localStreams: Record<string, MediaStream>;
+	private localStreams: Record<string, MediaStream>; // keyed by name
+	private readonly servers: RTCConfiguration;
 
-	private readonly servers = {
-		iceServers: [
-			{
-				urls: [
-					"stun:stun1.l.google.com:19302",
-					"stun:stun2.l.google.com:19302",
-				],
-			},
-		],
-	};
+	// Correlate stream.id → name when #stream-meta arrives before ontrack
+	private streamNameMap: Record<string, { peerId: string; name: string }> = {};
+	// Hold stream when ontrack fires before #stream-meta arrives
+	private pendingTracks: Record<
+		string,
+		{ peerId: string; stream: MediaStream }
+	> = {};
 
 	constructor(io: Manager, nsp: string, opts?: Partial<SocketOptions>) {
 		super(io, nsp, opts);
+
+		this.servers = {
+			iceServers: opts?.iceServers ?? [
+				{
+					urls: [
+						"stun:stun1.l.google.com:19302",
+						"stun:stun2.l.google.com:19302",
+					],
+				},
+			],
+		};
 
 		this.rtcpeers = {};
 		this.localStreams = {};
 
 		this.on("#init-rtc-offer", this.initializeConnection);
 		this.on("#rtc-message", this.handleCallServiceMessage);
-		/*
-		this.on("#offer", this.createAnswer);
-		this.on("#answer", this.addAnswer);
-		this.on("#candidate", this.addIceCandidate);
-        */
+		this.on("#stream-meta", this.handleStreamMeta);
 	}
 
 	getPeer(id: string) {
 		return this.rtcpeers[id];
 	}
+
 	async handleCallServiceMessage(payload: MessagePayload) {
 		const { source } = payload;
 
-		let peer = this.getPeer(source);
-		if (!peer) peer = this.initializeConnection(payload, { polite: false });
+		const peer =
+			this.getPeer(source) ??
+			this.initializeConnection(payload, { polite: false });
+		if (!peer) return;
 
-		console.log("== peer ==", peer);
 		const { description, candidate } = payload.data;
+
 		if (description) {
 			const readyForOffer =
 				!peer.connectionStatus.makingOffer &&
 				(peer.connection.signalingState === "stable" ||
 					peer.connectionStatus.isSettingRemoteAnswerPending);
 
-			const offerCollision =
-				description.type === "offer" && !readyForOffer;
+			const offerCollision = description.type === "offer" && !readyForOffer;
 
 			peer.connectionStatus.ignoreOffer = !peer.polite && offerCollision;
 
@@ -84,9 +91,7 @@ export class Socket extends RootSocket {
 
 			if (offerCollision) {
 				await Promise.all([
-					peer.connection.setLocalDescription({
-						type: "rollback",
-					}),
+					peer.connection.setLocalDescription({ type: "rollback" }),
 					peer.connection.setRemoteDescription(description),
 				]);
 			} else {
@@ -97,64 +102,59 @@ export class Socket extends RootSocket {
 
 			if (description.type === "offer") {
 				const answer = await peer.connection.createAnswer();
-
 				await peer.connection.setLocalDescription(answer);
-
 				this.emit("#rtc-message", {
 					source: this.id,
 					target: peer.socketId,
-					data: {
-						description: peer.connection.localDescription,
-					},
+					data: { description: peer.connection.localDescription },
 				});
 			}
 		} else if (candidate) {
 			try {
-				console.log("adding ice candidate", candidate);
-				console.log(typeof candidate);
 				await peer.connection.addIceCandidate(candidate);
 			} catch (error) {
 				if (!peer.connectionStatus.ignoreOffer) throw error;
 			}
 		}
 	}
-	/**
-	 * Initializes the peer connection.
-	 */
+
+	handleStreamMeta = (
+		payload: MessagePayload<{ streamId: string; name: string }>,
+	) => {
+		const {
+			source,
+			data: { streamId, name },
+		} = payload;
+
+		const pending = this.pendingTracks[streamId];
+		if (pending) {
+			delete this.pendingTracks[streamId];
+			this.listeners(name).forEach((listener) => {
+				listener({ id: source, stream: pending.stream });
+			});
+		} else {
+			this.streamNameMap[streamId] = { peerId: source, name };
+		}
+	};
+
 	initializeConnection(
 		payload: MessagePayload,
 		options: { polite: boolean } = { polite: true },
-	) {
+	): RTCPeer | undefined {
 		try {
 			const peer = this.createPeerConnection(payload, options);
-			for (const streamKey in this.localStreams) {
-				const stream = this.localStreams[streamKey];
-				this.addTransceiverPeerConnection(peer.connection, stream);
+			for (const name in this.localStreams) {
+				const mediaStream = this.localStreams[name];
+				this.addTransceiverPeerConnection(peer.connection, mediaStream);
+				this.sendStreamMeta(peer.socketId, name, mediaStream);
 			}
+			return peer;
 		} catch (error) {
-			// eslint-disable-next-line no-console
 			console.error(error);
-		} finally {
-			return this.getPeer(payload.source);
+			return undefined;
 		}
 	}
 
-	/**
-	 * Attaches local media transceivers to peer connection.
-	 */
-	addTransceiversToPeerConnection(
-		peerConnection: RTCPeerConnection,
-		streams: Record<string, MediaStream>,
-	) {
-		for (const streamKey in streams) {
-			const stream = streams[streamKey];
-			this.addTransceiverPeerConnection(peerConnection, stream);
-		}
-	}
-
-	/**
-	 * Attaches local media transceiver to peer connection.
-	 */
 	addTransceiverPeerConnection(
 		peerConnection: RTCPeerConnection,
 		stream: MediaStream,
@@ -167,21 +167,14 @@ export class Socket extends RootSocket {
 		});
 	}
 
-	/**
-	 * Stop local media tracks of peer connection.
-	 */
 	stopLocalStreamTracks(localStream: MediaStream) {
 		localStream.getTracks().forEach((track) => track.stop());
 	}
 
-	/**
-	 * Creates peer connection
-	 * @returns {RTCPeerConnection} instance of RTCPeerConnection.
-	 */
-	createPeerConnection = (
+	createPeerConnection(
 		payload: MessagePayload,
 		options: { polite: boolean },
-	): RTCPeer => {
+	): RTCPeer {
 		const peerConnection = new RTCPeerConnection(this.servers);
 		const { source } = payload;
 
@@ -190,98 +183,79 @@ export class Socket extends RootSocket {
 			streams: {},
 			socketId: source,
 			polite: options.polite,
+			emittedStreamIds: new Set(),
 			connectionStatus: {
 				makingOffer: false,
 				ignoreOffer: false,
 				isSettingRemoteAnswerPending: false,
-				isActive: true,
 			},
 		};
-
-		//webcam transceiver,
-		//screen share transceiver
 
 		const peer = this.rtcpeers[source];
 
 		peer.connection.ontrack = ({ transceiver, streams: [stream] }) => {
-			if (transceiver.mid) {
-				peer.streams[transceiver.mid] = stream;
-				this.listeners("stream").forEach((listener) => {
-					listener({
-						id: source,
-						stream: stream,
-					});
+			if (!stream) return;
+
+			peer.streams[transceiver.mid ?? transceiver.receiver.track.id] = stream;
+
+			// ontrack fires once per track; deduplicate to emit once per stream
+			if (peer.emittedStreamIds.has(stream.id)) return;
+			peer.emittedStreamIds.add(stream.id);
+
+			const meta = this.streamNameMap[stream.id];
+			if (meta) {
+				delete this.streamNameMap[stream.id];
+				this.listeners(meta.name).forEach((listener) => {
+					listener({ id: source, stream });
 				});
+			} else {
+				// #stream-meta hasn't arrived yet — hold until it does
+				this.pendingTracks[stream.id] = { peerId: source, stream };
 			}
 		};
 
 		peer.connection.oniceconnectionstatechange = () => {
 			switch (peer.connection.iceConnectionState) {
-				// case "connected":
-
-				// 	break;
 				case "disconnected":
+					delete this.rtcpeers[source];
 					this.listeners("peer-disconnect").forEach((listener) => {
-						listener({
-							id: source,
-						});
+						listener({ id: source });
 					});
 					break;
 				case "failed":
-					if (peer.connection.restartIce) {
-						peer.connection.restartIce();
-					} else {
-						//restartice
-					}
-
+					peer.connection.restartIce?.();
 					break;
 				case "closed":
-					console.log("ice connection closed");
+					delete this.rtcpeers[source];
 					break;
 				default:
 					break;
 			}
 		};
 
-		peer.connection.onicecandidate = async (event) => {
+		peer.connection.onicecandidate = (event) => {
 			if (event.candidate) {
-				const payload: MessagePayload<any> = {
+				this.emit("#rtc-message", {
 					source: this.id!,
 					target: source,
-					data: {
-						candidate: event.candidate,
-					},
-				};
-
-				this.emit("#rtc-message", payload);
+					data: { candidate: event.candidate },
+				});
 			}
 		};
 
 		peer.connection.onnegotiationneeded = async () => {
 			if (peer.connection.signalingState === "have-remote-offer") return;
-
-			if (peer.connectionStatus.makingOffer) {
-				return;
-			}
-
+			if (peer.connectionStatus.makingOffer) return;
 			try {
 				peer.connectionStatus.makingOffer = true;
-
 				const offer = await peer.connection.createOffer();
-				//@ts-ignore
-				if (peer.connection.signalingState !== "have-remote-offer") {
-					await peer.connection.setLocalDescription(offer);
-
-					this.emit("#rtc-message", {
-						target: peer.socketId,
-						source: this.id,
-						data: {
-							description: peer.connection.localDescription,
-						},
-					});
-				}
+				await peer.connection.setLocalDescription(offer);
+				this.emit("#rtc-message", {
+					target: peer.socketId,
+					source: this.id,
+					data: { description: peer.connection.localDescription },
+				});
 			} catch (error) {
-				// eslint-disable-next-line no-console
 				console.error(error);
 			} finally {
 				peer.connectionStatus.makingOffer = false;
@@ -289,66 +263,48 @@ export class Socket extends RootSocket {
 		};
 
 		return peer;
-	};
+	}
 
-	stream = (stream: MediaStream) => {
+	private sendStreamMeta(targetId: string, name: string, stream: MediaStream) {
+		this.emit("#stream-meta", {
+			source: this.id,
+			target: targetId,
+			data: { streamId: stream.id, name },
+		});
+	}
+
+	stream = (name: string, mediaStream: MediaStream) => {
+		this.localStreams[name] = mediaStream;
 		if (!this.connected) return;
 
-		//TODO: stop local stream tracks if stream already exists
-
-		this.localStreams[stream.id] = stream;
-
 		Object.values(this.rtcpeers).forEach((peer) => {
-			this._stream(peer);
+			this.addTransceiverPeerConnection(peer.connection, mediaStream);
+			this.sendStreamMeta(peer.socketId, name, mediaStream);
 		});
-	};
-
-	private _stream = (peer: RTCPeer) => {
-		for (const streamKey in this.localStreams) {
-			const stream = this.localStreams[streamKey];
-			this.addTransceiverPeerConnection(peer.connection, stream);
-		}
 	};
 
 	async getStats(peerId: string) {
 		const peerConnection = this.getPeer(peerId)?.connection;
-		if (!peerConnection) {
-			return null;
-		}
+		if (!peerConnection) return null;
 
-		const statsMap = new Map();
-
-		return new Promise((resolve) => {
-			peerConnection!.getStats().then((stats) => {
-				stats.forEach((report) => {
-					const { type } = report;
-
-					if (!statsMap.has(type)) {
-						statsMap.set(type, []);
-					}
-
-					statsMap.get(type).push({ report, description: type });
-				});
-
-				resolve(statsMap);
-			});
+		const statsMap = new Map<string, any[]>();
+		const stats = await peerConnection.getStats();
+		stats.forEach((report) => {
+			if (!statsMap.has(report.type)) statsMap.set(report.type, []);
+			statsMap.get(report.type)!.push({ report, description: report.type });
 		});
+		return statsMap;
 	}
 
 	async getSessionStats(peerId: string) {
 		const peerConnection = this.getPeer(peerId)?.connection;
 		if (!peerConnection) return null;
-		return await getRTCStats(peerConnection, {});
+		return getRTCStats(peerConnection, {});
 	}
 
 	async getIceCandidateStats(peerId: string) {
 		const peerConnection = this.getPeer(peerId)?.connection;
 		if (!peerConnection) return null;
-		return await getRTCIceCandidateStatsReport(peerConnection);
-	}
-
-	private getQueryParam(name: string | undefined = "room") {
-		const urlParams = new URLSearchParams(window.location.search);
-		return urlParams.get(name) || "";
+		return getRTCIceCandidateStatsReport(peerConnection);
 	}
 }

@@ -1,6 +1,9 @@
 "use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.Socket = exports.Manager = exports.protocol = void 0;
+exports.RTCIOStream = exports.Socket = exports.Manager = exports.protocol = void 0;
 exports.io = lookup;
 exports.connect = lookup;
 exports.default = lookup;
@@ -9,6 +12,8 @@ const rtc_1 = require("./lib/rtc");
 Object.defineProperty(exports, "Socket", { enumerable: true, get: function () { return rtc_1.Socket; } });
 const manager_1 = require("./lib/manager");
 Object.defineProperty(exports, "Manager", { enumerable: true, get: function () { return manager_1.Manager; } });
+const stream_1 = __importDefault(require("./lib/stream"));
+exports.RTCIOStream = stream_1.default;
 /**
  * Managers cache.
  */

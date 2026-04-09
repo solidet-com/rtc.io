@@ -2,58 +2,46 @@ import { SocketOptions as RootSocketOptions, Socket as RootSocket } from "socket
 import { Manager } from "./manager";
 import { MessagePayload } from "./payload";
 export interface SocketOptions extends Partial<RootSocketOptions> {
-    iceServers: RTCIceServer[];
+    iceServers?: RTCIceServer[];
 }
 type RTCPeer = {
     connection: RTCPeerConnection;
     socketId: string;
     polite: boolean;
-    connectionStatus: connectionStatus;
+    connectionStatus: ConnectionStatus;
     streams: Record<string, MediaStream>;
+    emittedStreamIds: Set<string>;
 };
-type connectionStatus = {
+type ConnectionStatus = {
     makingOffer: boolean;
     ignoreOffer: boolean;
     isSettingRemoteAnswerPending: boolean;
-    isActive: boolean;
 };
 export declare class Socket extends RootSocket {
     private rtcpeers;
     private localStreams;
     private readonly servers;
+    private streamNameMap;
+    private pendingTracks;
     constructor(io: Manager, nsp: string, opts?: Partial<SocketOptions>);
     getPeer(id: string): RTCPeer;
     handleCallServiceMessage(payload: MessagePayload): Promise<void>;
-    /**
-     * Initializes the peer connection.
-     */
+    handleStreamMeta: (payload: MessagePayload<{
+        streamId: string;
+        name: string;
+    }>) => void;
     initializeConnection(payload: MessagePayload, options?: {
         polite: boolean;
-    }): RTCPeer;
-    /**
-     * Attaches local media transceivers to peer connection.
-     */
-    addTransceiversToPeerConnection(peerConnection: RTCPeerConnection, streams: Record<string, MediaStream>): void;
-    /**
-     * Attaches local media transceiver to peer connection.
-     */
+    }): RTCPeer | undefined;
     addTransceiverPeerConnection(peerConnection: RTCPeerConnection, stream: MediaStream): void;
-    /**
-     * Stop local media tracks of peer connection.
-     */
     stopLocalStreamTracks(localStream: MediaStream): void;
-    /**
-     * Creates peer connection
-     * @returns {RTCPeerConnection} instance of RTCPeerConnection.
-     */
-    createPeerConnection: (payload: MessagePayload, options: {
+    createPeerConnection(payload: MessagePayload, options: {
         polite: boolean;
-    }) => RTCPeer;
-    stream: (stream: MediaStream) => void;
-    private _stream;
-    getStats(peerId: string): Promise<unknown>;
+    }): RTCPeer;
+    private sendStreamMeta;
+    stream: (name: string, mediaStream: MediaStream) => void;
+    getStats(peerId: string): Promise<Map<string, any[]> | null>;
     getSessionStats(peerId: string): Promise<import("./stats/stats.js").RTCSample | null>;
     getIceCandidateStats(peerId: string): Promise<any>;
-    private getQueryParam;
 }
 export {};
