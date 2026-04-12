@@ -16,7 +16,6 @@ type connectionStatus = {
     makingOffer: boolean;
     ignoreOffer: boolean;
     isSettingRemoteAnswerPending: boolean;
-    isActive: boolean;
 };
 export declare class Socket extends RootSocket {
     private rtcpeers;

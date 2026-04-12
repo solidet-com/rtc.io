@@ -23,7 +23,6 @@ type connectionStatus = {
 	makingOffer: boolean;
 	ignoreOffer: boolean;
 	isSettingRemoteAnswerPending: boolean;
-	isActive: boolean;
 };
 
 export class Socket extends RootSocket {
@@ -133,7 +132,8 @@ export class Socket extends RootSocket {
 		);
 	};
 
-	// ─── Bug #1 Fix: Defer stream replay for impolite peers ──────────────
+	// ─── W3C Perfect Negotiation: Incoming signaling message handler ─────
+	// Reference: https://w3c.github.io/webrtc-pc/#perfect-negotiation-example
 	async handleCallServiceMessage(payload: MessagePayload) {
 		const { source } = payload;
 
@@ -153,6 +153,7 @@ export class Socket extends RootSocket {
 		if (description) {
 			this.log('debug', `Received ${description.type}`, { peer: source, signalingState: peer.connection.signalingState });
 
+			// ── Perfect Negotiation: collision detection ──────────────────
 			const readyForOffer =
 				!peer.connectionStatus.makingOffer &&
 				(peer.connection.signalingState === "stable" ||
@@ -168,72 +169,44 @@ export class Socket extends RootSocket {
 				return;
 			}
 
+			// ── Perfect Negotiation: single setRemoteDescription path ────
+			// The W3C spec uses ONE setRemoteDescription call for ALL types.
+			// The browser handles rollback implicitly when we call
+			// setRemoteDescription(offer) while in have-local-offer state
+			// (for polite peers). No manual rollback needed.
 			peer.connectionStatus.isSettingRemoteAnswerPending =
 				description.type === "answer";
 
 			try {
-				if (offerCollision) {
-					// Polite peer: rollback our own offer, then apply the remote offer.
-					// Only rollback if we're actually in have-local-offer;
-					// if we're already stable (e.g. our offer finished while queued)
-					// just apply the remote description directly.
-					this.log('debug', 'Offer collision (polite) — rolling back', { peer: source });
-					if (peer.connection.signalingState !== "stable") {
-						await peer.connection.setLocalDescription({ type: "rollback" });
-					}
-					await peer.connection.setRemoteDescription(description);
-				} else if (description.type === "answer") {
-					// Guard: only apply an answer when we're actually expecting one
-					if (peer.connection.signalingState === "have-local-offer") {
-						await peer.connection.setRemoteDescription(description);
-					} else {
-						this.log('warn', `Dropping stale answer (state: ${peer.connection.signalingState})`, { peer: source });
-						return;
-					}
-				} else {
-					// Normal offer when we're stable
-					await peer.connection.setRemoteDescription(description);
-				}
+				await peer.connection.setRemoteDescription(description);
 			} catch (err: any) {
-				if (err?.name === 'InvalidStateError') {
-					this.log('warn', `setRemoteDescription InvalidStateError (state: ${peer.connection.signalingState}), dropping`, { peer: source });
+				// If the browser doesn't support implicit rollback, do it manually
+				if (err?.name === 'InvalidStateError' && offerCollision) {
+					this.log('debug', 'Implicit rollback not supported, doing manual rollback', { peer: source });
+					await peer.connection.setLocalDescription({ type: "rollback" });
+					await peer.connection.setRemoteDescription(description);
+				} else {
+					this.log('warn', `setRemoteDescription failed (state: ${peer.connection.signalingState})`, { peer: source, err: err?.message });
 					return;
 				}
-				throw err;
+			} finally {
+				peer.connectionStatus.isSettingRemoteAnswerPending = false;
 			}
 
-			peer.connectionStatus.isSettingRemoteAnswerPending = false;
-
+			// ── Perfect Negotiation: answer with implicit SDP creation ───
 			if (description.type === "offer") {
-				try {
-					const answer = await peer.connection.createAnswer();
-
-					// Re-check state: between createAnswer and now, another
-					// message could have changed the state via the queue.
-					if (peer.connection.signalingState === "have-remote-offer") {
-						await peer.connection.setLocalDescription(answer);
-
-						this.emit("#rtc-message", {
-							source: this.id,
-							target: peer.socketId,
-							data: {
-								description: peer.connection.localDescription,
-							},
-						});
-						this.log('debug', 'Sent answer', { peer: source });
-					} else {
-						this.log('warn', `Skipping setLocalDescription(answer) — state became ${peer.connection.signalingState}`, { peer: source });
-					}
-				} catch (err: any) {
-					if (err?.name === 'InvalidStateError') {
-						this.log('warn', `createAnswer/setLocalDescription InvalidStateError (state: ${peer.connection.signalingState})`, { peer: source });
-					} else {
-						throw err;
-					}
-				}
+				await peer.connection.setLocalDescription();
+				this.emit("#rtc-message", {
+					source: this.id,
+					target: peer.socketId,
+					data: {
+						description: peer.connection.localDescription,
+					},
+				});
+				this.log('debug', 'Sent answer', { peer: source });
 			}
 
-			// Bug #1: Now that signaling is stable, safe to add local tracks
+			// Now that signaling is stable, safe to add local tracks
 			// without onnegotiationneeded racing with the incoming offer.
 			if (isNewPeer) {
 				this.replayStreamsToPeer(peer);
@@ -241,8 +214,8 @@ export class Socket extends RootSocket {
 		} else if (candidate) {
 			try {
 				await peer.connection.addIceCandidate(candidate);
-			} catch (error) {
-				if (!peer.connectionStatus.ignoreOffer) throw error;
+			} catch (err) {
+				if (!peer.connectionStatus.ignoreOffer) throw err;
 			}
 		} else if (events) {
 			const rtcioStream = peer.streams[mid]; //id asil idden farkli.!
@@ -284,7 +257,7 @@ export class Socket extends RootSocket {
 		}
 	}
 
-	// ─── Bug #1: Replay local streams to a peer after signaling is stable ─
+	// ─── Replay local streams to a peer after signaling is stable ────
 	private replayStreamsToPeer(peer: RTCPeer) {
 		for (const streamKey in this.streamEvents) {
 			const events = this.streamEvents[streamKey];
@@ -405,24 +378,22 @@ export class Socket extends RootSocket {
 		return data;
 	}
 
-	// ─── Bug #4 & #5: Idle transceiver reuse + sendonly direction ─────────
+	// ─── Transceiver management: reuse idle + sendonly direction ─────────
 	addTransceiverToPeer(peer: RTCPeer, rtcioStream: RTCIOStream) {
-		let transceiver!: RTCRtpTransceiver;
-
 		// Store the stream reference even if it has no tracks
 		peer.streams[rtcioStream.mediaStream.id] = rtcioStream;
 		
+		// Listen for track changes on this stream (e.g. user toggles camera)
 		rtcioStream.onTrackChanged((stream) => {
 			const tracks = stream.getTracks();
 			tracks.forEach(track => {
-				const existingTransceiver = Array.from(peer.connection.getTransceivers()).find(
+				const existingTransceiver = peer.connection.getTransceivers().find(
 					t => t.sender.track && t.sender.track.kind === track.kind
 				);
 				
 				if (existingTransceiver) {
 					existingTransceiver.sender.replaceTrack(track);
 				} else {
-					// Bug #5: Use sendonly for outbound streams
 					peer.connection.addTransceiver(track, {
 						direction: "sendonly",
 						streams: [rtcioStream.mediaStream],
@@ -434,19 +405,17 @@ export class Socket extends RootSocket {
 
 		const tracks = rtcioStream.mediaStream.getTracks();
 		if (tracks.length === 0) {
-			// Bug #5: sendonly for placeholder transceiver
-			transceiver = peer.connection.addTransceiver('audio', {
+			// Placeholder transceiver so the peer knows we have a stream slot
+			peer.connection.addTransceiver('audio', {
 				direction: "sendonly"
 			});
-			// Browser fires onnegotiationneeded automatically
 			return;
 		}
 
 		tracks.forEach((track) => {
-			//  if user has sent an audio or video stream
 			if (track.kind === 'audio' || track.kind === 'video') {
-				// Bug #4: Reuse existing idle transceiver (sender.track === null, same kind)
-				// instead of always creating a new one — prevents transceiver accumulation on toggle
+				// Reuse existing idle transceiver (sender.track === null, same kind)
+				// instead of always creating a new one — prevents transceiver accumulation
 				const idle = peer.connection.getTransceivers().find(
 					t => t.sender.track === null
 						&& t.receiver.track?.kind === track.kind
@@ -458,8 +427,7 @@ export class Socket extends RootSocket {
 					idle.direction = "sendonly";
 					this.log('debug', 'Reused idle transceiver', { kind: track.kind, peer: peer.socketId });
 				} else {
-					// Bug #5: sendonly for outbound streams in mesh P2P topology
-					transceiver = peer.connection.addTransceiver(track, {
+					peer.connection.addTransceiver(track, {
 						direction: "sendonly",
 						streams: [rtcioStream.mediaStream],
 					});
@@ -490,7 +458,6 @@ export class Socket extends RootSocket {
 				makingOffer: false,
 				ignoreOffer: false,
 				isSettingRemoteAnswerPending: false,
-				isActive: true,
 			},
 		};
 
@@ -501,13 +468,13 @@ export class Socket extends RootSocket {
 
 		this.log('debug', `Created peer connection`, { peer: source, polite: options.polite });
 
-		// ─── Bug #3 & #6: Rewritten ontrack handler ──────────────────────
+		// ─── ontrack: handle incoming remote tracks ──────────────────────
 		// Uses stream.onaddtrack for late-arriving tracks instead of timers.
-		// Handles empty streams array (Bug #6) by creating a synthetic stream.
+		// Handles empty streams array by creating a synthetic stream.
 		peer.connection.ontrack = ({ transceiver, track, streams }) => {
 			let stream = streams[0];
 
-			// Bug #6: Handle empty streams array — create synthetic MediaStream
+			// Handle empty streams array — create synthetic MediaStream
 			if (!stream) {
 				stream = new MediaStream([track]);
 				this.log('warn', 'ontrack: no associated stream, created synthetic', {
@@ -552,8 +519,7 @@ export class Socket extends RootSocket {
 
 			// Bug #3: Listen for future tracks arriving on this same stream.
 			// The browser fires 'addtrack' when a new track is associated with
-			// this MediaStream (e.g., video arriving after audio). This is the
-			// event-driven alternative to debouncing with timers.
+			// this MediaStream (e.g., video arriving after audio).
 			stream.onaddtrack = ({ track: newTrack }) => {
 				this.log('debug', 'Late track arrived via stream.onaddtrack', {
 					peer: source, kind: newTrack.kind, streamId: stream.id,
@@ -578,16 +544,14 @@ export class Socket extends RootSocket {
 			this.emit("#rtc-message", eventPayload);
 		};
 
-		// ─── Bug #2: Proper ICE state machine — no premature deletion ────
-		// 'disconnected' is transient: ICE will auto-transition to 'failed'
-		// if recovery is not possible. No timers needed.
+		// ─── ICE state machine ──────────────────────────────────────────
+		// 'disconnected' is transient and will auto-recover or transition to 'failed'.
 		peer.connection.oniceconnectionstatechange = () => {
 			this.log('debug', `ICE state: ${peer.connection.iceConnectionState}`, { peer: source });
 			switch (peer.connection.iceConnectionState) {
 				case "disconnected":
-					// Bug #2: Transient state — do nothing.
-					// The ICE agent will self-transition to 'failed' if unrecoverable,
-					// or recover to 'connected'/'completed' on its own.
+					// Transient state — do nothing. ICE will self-recover
+					// or transition to 'failed' if unrecoverable.
 					break;
 				case "failed":
 					peer.connection.restartIce();
@@ -601,8 +565,8 @@ export class Socket extends RootSocket {
 			}
 		};
 
-		// Bug #2: connectionState aggregates ICE + DTLS — more reliable
-		// than iceConnectionState alone. Use as primary state handler.
+		// connectionState aggregates ICE + DTLS — more reliable than
+		// iceConnectionState alone. Use as primary disconnect handler.
 		peer.connection.onconnectionstatechange = () => {
 			this.log('debug', `Connection state: ${peer.connection.connectionState}`, { peer: source });
 			switch (peer.connection.connectionState) {
@@ -630,25 +594,18 @@ export class Socket extends RootSocket {
 			}
 		};
 
+		// ── W3C Perfect Negotiation: onnegotiationneeded ─────────────────
+		// Reference: https://w3c.github.io/webrtc-pc/#perfect-negotiation-example
+		// The spec does NOT check signalingState before making an offer.
+		// It relies solely on makingOffer + the collision detection in
+		// handleCallServiceMessage to resolve glare.
 		peer.connection.onnegotiationneeded = async () => {
-			// Skip if we're in the middle of handling a remote offer
-			if (peer.connection.signalingState !== "stable") {
-				this.log('debug', `onnegotiationneeded skipped (state: ${peer.connection.signalingState})`, { peer: source });
-				return;
-			}
-
-			if (peer.connectionStatus.makingOffer) {
-				this.log('debug', 'onnegotiationneeded skipped (already making offer)', { peer: source });
-				return;
-			}
-
 			try {
 				peer.connectionStatus.makingOffer = true;
 				this.log('debug', 'onnegotiationneeded — creating offer', { peer: source });
 
-				// Use the implicit offer creation path: setLocalDescription()
-				// with no arguments lets the browser create the correct SDP
-				// and avoids the race between createOffer() and state changes.
+				// Implicit SDP creation: setLocalDescription() with no args
+				// creates the correct offer/answer based on current state.
 				await peer.connection.setLocalDescription();
 
 				this.emit("#rtc-message", {
@@ -660,11 +617,7 @@ export class Socket extends RootSocket {
 				});
 				this.log('debug', 'Sent offer', { peer: source });
 			} catch (error: any) {
-				if (error?.name === 'InvalidStateError') {
-					this.log('warn', `onnegotiationneeded InvalidStateError (state: ${peer.connection.signalingState}), skipping`, { peer: source });
-				} else {
-					console.error(error);
-				}
+				this.log('error', `onnegotiationneeded error: ${error?.message}`, { peer: source });
 			} finally {
 				peer.connectionStatus.makingOffer = false;
 			}
@@ -673,10 +626,9 @@ export class Socket extends RootSocket {
 		return peer;
 	};
 
-	// ─── Bug #2 & #7: Centralized peer cleanup ───────────────────────────
-	// Properly closes the connection, removes all references, and notifies
-	// the application. Stale stream references are garbage-collected with
-	// the peer object.
+	// ─── Centralized peer cleanup ────────────────────────────────────
+	// Closes the connection, removes all references, and notifies
+	// the application.
 	private cleanupPeer(peerId: string) {
 		const peer = this.rtcpeers[peerId];
 		if (!peer) return;
@@ -692,11 +644,11 @@ export class Socket extends RootSocket {
 		});
 	}
 
-	private broadcastPeers = (cb: Function, ...args: any[]) => {
+	private broadcastPeers = (cb: (peer: RTCPeer, ...args: any[]) => void, ...args: any[]) => {
 		if (!this.connected) return;
 
 		Object.values(this.rtcpeers).forEach((peer) => {
-			cb(peer, ...args);
+			cb.call(this, peer, ...args);
 		});
 	};
 
