@@ -17,6 +17,9 @@ class RTCIOStream {
         }
     }
     _handleStream(peerConnection, socketId) {
+        // Guard: transceivers are already wired for this peer (e.g. emit called twice)
+        if (this.videoTransceivers[socketId] || this.audioTransceivers[socketId])
+            return;
         const videoTrack = this.mediaStream.getVideoTracks()[0];
         const audioTrack = this.mediaStream.getAudioTracks()[0];
         if (videoTrack) {
