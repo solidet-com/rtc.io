@@ -21,14 +21,21 @@ type connectionStatus = {
 export declare class Socket extends RootSocket {
     private rtcpeers;
     private streamEvents;
+    private signalingQueues;
     private readonly servers;
     constructor(io: Manager, nsp: string, opts?: Partial<SocketOptions>);
+    private log;
     emit(ev: any, ...args: any[]): this;
     private getRTCIOStreamDeep;
     getPeer(id: string): RTCPeer;
+    private enqueueSignalingMessage;
     handleCallServiceMessage(payload: MessagePayload): Promise<void>;
+    private replayStreamsToPeer;
     /**
      * Initializes the peer connection.
+     * Used for the POLITE path (via #init-rtc-offer).
+     * Polite peers initiate the offer, so replaying streams immediately is safe —
+     * there's no incoming offer to collide with.
      */
     initializeConnection(payload: MessagePayload, options?: {
         polite: boolean;
@@ -44,6 +51,7 @@ export declare class Socket extends RootSocket {
     createPeerConnection: (payload: MessagePayload, options: {
         polite: boolean;
     }) => RTCPeer;
+    private cleanupPeer;
     private broadcastPeers;
     getStats(peerId: string): Promise<unknown>;
     getSessionStats(peerId: string): Promise<import("./stats/stats.js").RTCSample | null>;

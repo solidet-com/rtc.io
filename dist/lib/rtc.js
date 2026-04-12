@@ -17,6 +17,17 @@ class Socket extends socket_io_client_1.Socket {
                 },
             ],
         };
+        // ─── Signaling serialization: per-peer async queue ───────────────────
+        // Prevents two signaling messages from interleaving their async steps
+        // (e.g. two offers arriving back-to-back, or an offer + answer crossing).
+        this.enqueueSignalingMessage = (payload) => {
+            var _a;
+            const peerId = payload.source;
+            const prev = (_a = this.signalingQueues[peerId]) !== null && _a !== void 0 ? _a : Promise.resolve();
+            this.signalingQueues[peerId] = prev.then(() => this.handleCallServiceMessage(payload).catch((err) => {
+                this.log('error', 'Signaling error', { peer: peerId, err });
+            }));
+        };
         /**
          * Creates peer connection
          * @returns {RTCPeerConnection} instance of RTCPeerConnection.
@@ -39,65 +50,105 @@ class Socket extends socket_io_client_1.Socket {
             //webcam transceiver,
             //screen share transceiver
             const peer = this.rtcpeers[source];
-            peer.connection.ontrack = ({ transceiver, streams: [stream] }) => {
-                if (transceiver.mid) {
-                    // If we already have this stream, we need to update it with the new track
-                    if (peer.streams[stream.id]) {
-                        // Check if the track is already in the stream
-                        const existingTrack = peer.streams[stream.id].mediaStream.getTracks().find(t => t.kind === transceiver.receiver.track.kind);
-                        if (!existingTrack) {
-                            // Add the new track to the existing stream
-                            peer.streams[stream.id].mediaStream.addTrack(transceiver.receiver.track);
-                        }
-                        else {
-                            // Replace the existing track with the new one
-                            peer.streams[stream.id].mediaStream.removeTrack(existingTrack);
-                            peer.streams[stream.id].mediaStream.addTrack(transceiver.receiver.track);
-                        }
-                        // Notify about track addition
-                        this.listeners("track-added").forEach((listener) => {
-                            listener({
-                                peerId: source,
-                                stream: peer.streams[stream.id].mediaStream,
-                                track: transceiver.receiver.track
-                            });
-                        });
-                        return;
-                    }
-                    peer.streams[stream.id] = new stream_1.RTCIOStream(stream);
-                    const payload = {
-                        source: this.id,
-                        target: source,
-                        data: {
-                            mid: stream.id,
-                        },
-                    };
-                    this.emit("#rtc-message", payload);
+            this.log('debug', `Created peer connection`, { peer: source, polite: options.polite });
+            // ─── Bug #3 & #6: Rewritten ontrack handler ──────────────────────
+            // Uses stream.onaddtrack for late-arriving tracks instead of timers.
+            // Handles empty streams array (Bug #6) by creating a synthetic stream.
+            peer.connection.ontrack = ({ transceiver, track, streams }) => {
+                let stream = streams[0];
+                // Bug #6: Handle empty streams array — create synthetic MediaStream
+                if (!stream) {
+                    stream = new MediaStream([track]);
+                    this.log('warn', 'ontrack: no associated stream, created synthetic', {
+                        peer: source, trackKind: track.kind, trackId: track.id,
+                    });
                 }
-            };
-            peer.connection.oniceconnectionstatechange = () => {
-                switch (peer.connection.iceConnectionState) {
-                    // case "connected":
-                    // 	break;
-                    case "disconnected":
-                        this.listeners("peer-disconnect").forEach((listener) => {
-                            listener({
-                                id: source,
-                            });
+                if (!transceiver.mid)
+                    return;
+                this.log('debug', 'ontrack fired', {
+                    peer: source, streamId: stream.id, trackKind: track.kind, mid: transceiver.mid,
+                });
+                // If we already have this stream, update it with the new track
+                if (peer.streams[stream.id]) {
+                    const existingStream = peer.streams[stream.id].mediaStream;
+                    const existingTrack = existingStream.getTracks().find(t => t.kind === track.kind);
+                    if (existingTrack && existingTrack.id !== track.id) {
+                        existingStream.removeTrack(existingTrack);
+                    }
+                    if (!existingStream.getTrackById(track.id)) {
+                        existingStream.addTrack(track);
+                    }
+                    // Notify about track addition
+                    this.listeners("track-added").forEach((listener) => {
+                        listener({
+                            peerId: source,
+                            stream: existingStream,
+                            track: track,
                         });
+                    });
+                    return;
+                }
+                // New stream — register it
+                peer.streams[stream.id] = new stream_1.RTCIOStream(stream);
+                // Bug #3: Listen for future tracks arriving on this same stream.
+                // The browser fires 'addtrack' when a new track is associated with
+                // this MediaStream (e.g., video arriving after audio). This is the
+                // event-driven alternative to debouncing with timers.
+                stream.onaddtrack = ({ track: newTrack }) => {
+                    this.log('debug', 'Late track arrived via stream.onaddtrack', {
+                        peer: source, kind: newTrack.kind, streamId: stream.id,
+                    });
+                    this.listeners("track-added").forEach((listener) => {
+                        listener({
+                            peerId: source,
+                            stream: stream,
+                            track: newTrack,
+                        });
+                    });
+                };
+                // Request event metadata for this stream
+                const eventPayload = {
+                    source: this.id,
+                    target: source,
+                    data: {
+                        mid: stream.id,
+                    },
+                };
+                this.emit("#rtc-message", eventPayload);
+            };
+            // ─── Bug #2: Proper ICE state machine — no premature deletion ────
+            // 'disconnected' is transient: ICE will auto-transition to 'failed'
+            // if recovery is not possible. No timers needed.
+            peer.connection.oniceconnectionstatechange = () => {
+                this.log('debug', `ICE state: ${peer.connection.iceConnectionState}`, { peer: source });
+                switch (peer.connection.iceConnectionState) {
+                    case "disconnected":
+                        // Bug #2: Transient state — do nothing.
+                        // The ICE agent will self-transition to 'failed' if unrecoverable,
+                        // or recover to 'connected'/'completed' on its own.
                         break;
                     case "failed":
-                        if (peer.connection.restartIce) {
-                            peer.connection.restartIce();
-                        }
-                        else {
-                            //restartice
-                        }
+                        peer.connection.restartIce();
+                        this.log('debug', 'ICE failed — restarting', { peer: source });
                         break;
                     case "closed":
-                        console.log("ice connection closed");
+                        this.cleanupPeer(source);
                         break;
                     default:
+                        break;
+                }
+            };
+            // Bug #2: connectionState aggregates ICE + DTLS — more reliable
+            // than iceConnectionState alone. Use as primary state handler.
+            peer.connection.onconnectionstatechange = () => {
+                this.log('debug', `Connection state: ${peer.connection.connectionState}`, { peer: source });
+                switch (peer.connection.connectionState) {
+                    case "failed":
+                        peer.connection.restartIce();
+                        this.log('debug', 'Connection failed — restarting ICE', { peer: source });
+                        break;
+                    case "closed":
+                        this.cleanupPeer(source);
                         break;
                 }
             };
@@ -114,29 +165,38 @@ class Socket extends socket_io_client_1.Socket {
                 }
             };
             peer.connection.onnegotiationneeded = async () => {
-                if (peer.connection.signalingState === "have-remote-offer")
+                // Skip if we're in the middle of handling a remote offer
+                if (peer.connection.signalingState !== "stable") {
+                    this.log('debug', `onnegotiationneeded skipped (state: ${peer.connection.signalingState})`, { peer: source });
                     return;
+                }
                 if (peer.connectionStatus.makingOffer) {
+                    this.log('debug', 'onnegotiationneeded skipped (already making offer)', { peer: source });
                     return;
                 }
                 try {
                     peer.connectionStatus.makingOffer = true;
-                    const offer = await peer.connection.createOffer();
-                    //@ts-ignore
-                    if (peer.connection.signalingState !== "have-remote-offer") {
-                        await peer.connection.setLocalDescription(offer);
-                        this.emit("#rtc-message", {
-                            target: peer.socketId,
-                            source: this.id,
-                            data: {
-                                description: peer.connection.localDescription,
-                            },
-                        });
-                    }
+                    this.log('debug', 'onnegotiationneeded — creating offer', { peer: source });
+                    // Use the implicit offer creation path: setLocalDescription()
+                    // with no arguments lets the browser create the correct SDP
+                    // and avoids the race between createOffer() and state changes.
+                    await peer.connection.setLocalDescription();
+                    this.emit("#rtc-message", {
+                        target: peer.socketId,
+                        source: this.id,
+                        data: {
+                            description: peer.connection.localDescription,
+                        },
+                    });
+                    this.log('debug', 'Sent offer', { peer: source });
                 }
                 catch (error) {
-                    // eslint-disable-next-line no-console
-                    console.error(error);
+                    if ((error === null || error === void 0 ? void 0 : error.name) === 'InvalidStateError') {
+                        this.log('warn', `onnegotiationneeded InvalidStateError (state: ${peer.connection.signalingState}), skipping`, { peer: source });
+                    }
+                    else {
+                        console.error(error);
+                    }
                 }
                 finally {
                     peer.connectionStatus.makingOffer = false;
@@ -153,13 +213,20 @@ class Socket extends socket_io_client_1.Socket {
         };
         this.rtcpeers = {};
         this.streamEvents = {};
+        this.signalingQueues = {};
         this.on("#init-rtc-offer", this.initializeConnection);
-        this.on("#rtc-message", this.handleCallServiceMessage);
+        this.on("#rtc-message", this.enqueueSignalingMessage);
         /*
         this.on("#offer", this.createAnswer);
         this.on("#answer", this.addAnswer);
         this.on("#candidate", this.addIceCandidate);
         */
+    }
+    // ─── Structured Logging ──────────────────────────────────────────────
+    log(level, msg, data) {
+        var _a, _b;
+        const prefix = `[rtc-io][${(_b = (_a = this.id) === null || _a === void 0 ? void 0 : _a.slice(-6)) !== null && _b !== void 0 ? _b : '------'}]`;
+        console[level](`${prefix} ${msg}`, data !== null && data !== void 0 ? data : '');
     }
     emit(ev, ...args) {
         const stream = this.getRTCIOStreamDeep(args);
@@ -177,7 +244,7 @@ class Socket extends socket_io_client_1.Socket {
             // 		'video-channel2': {streamer: 'mehmet', stream: 'ahmet' },
             //  }
             // }
-            console.log("this.emit", ev, args);
+            this.log('debug', `emit stream event: ${ev}`, { streamId: stream.id });
             this.streamEvents[stream.id] = {
                 [ev]: args,
             };
@@ -212,44 +279,102 @@ class Socket extends socket_io_client_1.Socket {
     getPeer(id) {
         return this.rtcpeers[id];
     }
+    // ─── Bug #1 Fix: Defer stream replay for impolite peers ──────────────
     async handleCallServiceMessage(payload) {
         const { source } = payload;
+        let isNewPeer = false;
         let peer = this.getPeer(source);
-        if (!peer)
-            peer = this.initializeConnection(payload, { polite: false });
+        if (!peer) {
+            // Create bare connection — do NOT replay streams yet.
+            // Stream replay happens AFTER the initial offer/answer exchange
+            // to prevent onnegotiationneeded from racing with setRemoteDescription.
+            peer = this.createPeerConnection(payload, { polite: false });
+            peer.connection.createDataChannel("connectionSetup");
+            isNewPeer = true;
+            this.log('debug', 'Created impolite peer (deferred stream replay)', { peer: source });
+        }
         const { description, candidate, mid, events } = payload.data;
         if (description) {
+            this.log('debug', `Received ${description.type}`, { peer: source, signalingState: peer.connection.signalingState });
             const readyForOffer = !peer.connectionStatus.makingOffer &&
                 (peer.connection.signalingState === "stable" ||
                     peer.connectionStatus.isSettingRemoteAnswerPending);
             const offerCollision = description.type === "offer" && !readyForOffer;
             peer.connectionStatus.ignoreOffer = !peer.polite && offerCollision;
-            if (peer.connectionStatus.ignoreOffer)
+            if (peer.connectionStatus.ignoreOffer) {
+                this.log('debug', 'Ignoring colliding offer (impolite)', { peer: source });
                 return;
+            }
             peer.connectionStatus.isSettingRemoteAnswerPending =
                 description.type === "answer";
-            if (offerCollision) {
-                await Promise.all([
-                    peer.connection.setLocalDescription({
-                        type: "rollback",
-                    }),
-                    peer.connection.setRemoteDescription(description),
-                ]);
+            try {
+                if (offerCollision) {
+                    // Polite peer: rollback our own offer, then apply the remote offer.
+                    // Only rollback if we're actually in have-local-offer;
+                    // if we're already stable (e.g. our offer finished while queued)
+                    // just apply the remote description directly.
+                    this.log('debug', 'Offer collision (polite) — rolling back', { peer: source });
+                    if (peer.connection.signalingState !== "stable") {
+                        await peer.connection.setLocalDescription({ type: "rollback" });
+                    }
+                    await peer.connection.setRemoteDescription(description);
+                }
+                else if (description.type === "answer") {
+                    // Guard: only apply an answer when we're actually expecting one
+                    if (peer.connection.signalingState === "have-local-offer") {
+                        await peer.connection.setRemoteDescription(description);
+                    }
+                    else {
+                        this.log('warn', `Dropping stale answer (state: ${peer.connection.signalingState})`, { peer: source });
+                        return;
+                    }
+                }
+                else {
+                    // Normal offer when we're stable
+                    await peer.connection.setRemoteDescription(description);
+                }
             }
-            else {
-                await peer.connection.setRemoteDescription(description);
+            catch (err) {
+                if ((err === null || err === void 0 ? void 0 : err.name) === 'InvalidStateError') {
+                    this.log('warn', `setRemoteDescription InvalidStateError (state: ${peer.connection.signalingState}), dropping`, { peer: source });
+                    return;
+                }
+                throw err;
             }
             peer.connectionStatus.isSettingRemoteAnswerPending = false;
             if (description.type === "offer") {
-                const answer = await peer.connection.createAnswer();
-                await peer.connection.setLocalDescription(answer);
-                this.emit("#rtc-message", {
-                    source: this.id,
-                    target: peer.socketId,
-                    data: {
-                        description: peer.connection.localDescription,
-                    },
-                });
+                try {
+                    const answer = await peer.connection.createAnswer();
+                    // Re-check state: between createAnswer and now, another
+                    // message could have changed the state via the queue.
+                    if (peer.connection.signalingState === "have-remote-offer") {
+                        await peer.connection.setLocalDescription(answer);
+                        this.emit("#rtc-message", {
+                            source: this.id,
+                            target: peer.socketId,
+                            data: {
+                                description: peer.connection.localDescription,
+                            },
+                        });
+                        this.log('debug', 'Sent answer', { peer: source });
+                    }
+                    else {
+                        this.log('warn', `Skipping setLocalDescription(answer) — state became ${peer.connection.signalingState}`, { peer: source });
+                    }
+                }
+                catch (err) {
+                    if ((err === null || err === void 0 ? void 0 : err.name) === 'InvalidStateError') {
+                        this.log('warn', `createAnswer/setLocalDescription InvalidStateError (state: ${peer.connection.signalingState})`, { peer: source });
+                    }
+                    else {
+                        throw err;
+                    }
+                }
+            }
+            // Bug #1: Now that signaling is stable, safe to add local tracks
+            // without onnegotiationneeded racing with the incoming offer.
+            if (isNewPeer) {
+                this.replayStreamsToPeer(peer);
             }
         }
         else if (candidate) {
@@ -263,7 +388,7 @@ class Socket extends socket_io_client_1.Socket {
         }
         else if (events) {
             const rtcioStream = peer.streams[mid]; //id asil idden farkli.!
-            console.log("received events", events);
+            this.log('debug', 'Received stream events', { mid, events });
             Object.keys(events).forEach((key) => {
                 this.listeners(key).forEach((listener) => {
                     const subEvents = events[key];
@@ -292,8 +417,25 @@ class Socket extends socket_io_client_1.Socket {
             this.emit("#rtc-message", payload);
         }
     }
+    // ─── Bug #1: Replay local streams to a peer after signaling is stable ─
+    replayStreamsToPeer(peer) {
+        for (const streamKey in this.streamEvents) {
+            const events = this.streamEvents[streamKey];
+            const stream = this.getRTCIOStreamDeep(events);
+            if (stream) {
+                this.addTransceiverToPeer(peer, stream);
+            }
+        }
+        this.log('debug', 'Replayed streams to peer', {
+            peer: peer.socketId,
+            streamCount: Object.keys(this.streamEvents).length,
+        });
+    }
     /**
      * Initializes the peer connection.
+     * Used for the POLITE path (via #init-rtc-offer).
+     * Polite peers initiate the offer, so replaying streams immediately is safe —
+     * there's no incoming offer to collide with.
      */
     initializeConnection(payload, options = { polite: true }) {
         try {
@@ -313,6 +455,7 @@ class Socket extends socket_io_client_1.Socket {
             }
             // Broadcast existing streams to the new peer
             this.broadcastExistingStreams(peer);
+            this.log('debug', `Initialized ${options.polite ? 'polite' : 'impolite'} peer`, { peer: payload.source });
         }
         catch (error) {
             // eslint-disable-next-line no-console
@@ -357,11 +500,8 @@ class Socket extends socket_io_client_1.Socket {
     deserializeStreamEvent(data, rtcioStream) {
         if (typeof data === "string" && data.startsWith("[RTCIOStream]")) {
             const id = data.replace("[RTCIOStream] ", "");
-            console.log("---- ID -- SYNC ----");
-            console.log(rtcioStream.id);
+            this.log('debug', 'ID-Sync between peers', { from: rtcioStream.id, to: id });
             rtcioStream.id = id; // ID-Sync between peers
-            console.log(rtcioStream.id);
-            console.log("---- ID -- SYNC-END ----");
             return rtcioStream;
         }
         if (data instanceof stream_1.RTCIOStream) {
@@ -380,6 +520,7 @@ class Socket extends socket_io_client_1.Socket {
         }
         return data;
     }
+    // ─── Bug #4 & #5: Idle transceiver reuse + sendonly direction ─────────
     addTransceiverToPeer(peer, rtcioStream) {
         let transceiver;
         // Store the stream reference even if it has no tracks
@@ -392,36 +533,65 @@ class Socket extends socket_io_client_1.Socket {
                     existingTransceiver.sender.replaceTrack(track);
                 }
                 else {
+                    // Bug #5: Use sendonly for outbound streams
                     peer.connection.addTransceiver(track, {
-                        direction: "sendrecv",
+                        direction: "sendonly",
                         streams: [rtcioStream.mediaStream],
                     });
                 }
             });
-            // Force negotiation if needed
-            if (peer.connection.signalingState === "stable") {
-                peer.connection.dispatchEvent(new Event('negotiationneeded'));
-            }
+            // Browser fires onnegotiationneeded automatically after addTransceiver
         });
         const tracks = rtcioStream.mediaStream.getTracks();
         if (tracks.length === 0) {
+            // Bug #5: sendonly for placeholder transceiver
             transceiver = peer.connection.addTransceiver('audio', {
-                direction: "sendrecv"
+                direction: "sendonly"
             });
-            if (peer.connection.signalingState === "stable") {
-                peer.connection.dispatchEvent(new Event('negotiationneeded'));
-            }
+            // Browser fires onnegotiationneeded automatically
             return;
         }
         tracks.forEach((track) => {
             //  if user has sent an audio or video stream
             if (track.kind === 'audio' || track.kind === 'video') {
-                transceiver = peer.connection.addTransceiver(track, {
-                    direction: "sendrecv",
-                    streams: [rtcioStream.mediaStream],
+                // Bug #4: Reuse existing idle transceiver (sender.track === null, same kind)
+                // instead of always creating a new one — prevents transceiver accumulation on toggle
+                const idle = peer.connection.getTransceivers().find(t => {
+                    var _a;
+                    return t.sender.track === null
+                        && ((_a = t.receiver.track) === null || _a === void 0 ? void 0 : _a.kind) === track.kind
+                        && (t.direction === 'sendonly' || t.direction === 'sendrecv' || t.direction === 'inactive');
                 });
+                if (idle) {
+                    idle.sender.replaceTrack(track);
+                    idle.direction = "sendonly";
+                    this.log('debug', 'Reused idle transceiver', { kind: track.kind, peer: peer.socketId });
+                }
+                else {
+                    // Bug #5: sendonly for outbound streams in mesh P2P topology
+                    transceiver = peer.connection.addTransceiver(track, {
+                        direction: "sendonly",
+                        streams: [rtcioStream.mediaStream],
+                    });
+                }
                 peer.streams[rtcioStream.mediaStream.id] = rtcioStream;
             }
+        });
+    }
+    // ─── Bug #2 & #7: Centralized peer cleanup ───────────────────────────
+    // Properly closes the connection, removes all references, and notifies
+    // the application. Stale stream references are garbage-collected with
+    // the peer object.
+    cleanupPeer(peerId) {
+        const peer = this.rtcpeers[peerId];
+        if (!peer)
+            return;
+        this.log('debug', 'Cleaning up peer', { peer: peerId });
+        peer.connection.close();
+        delete this.rtcpeers[peerId];
+        delete this.signalingQueues[peerId];
+        this.listeners("peer-disconnect").forEach((listener) => {
+            listener({ id: peerId });
         });
     }
     async getStats(peerId) {
