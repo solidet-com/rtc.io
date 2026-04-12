@@ -9,6 +9,7 @@ import { RTCIOStream } from "./stream";
 
 export interface SocketOptions extends Partial<RootSocketOptions> {
 	iceServers: RTCIceServer[];
+	debug?: boolean;
 }
 
 type RTCPeer = {
@@ -17,18 +18,22 @@ type RTCPeer = {
 	polite: boolean;
 	connectionStatus: connectionStatus;
 	streams: Record<string, RTCIOStream>;
+	streamTransceivers: Record<string, RTCRtpTransceiver[]>; // mediaStream.id → transceivers for that stream
 };
 
 type connectionStatus = {
 	makingOffer: boolean;
 	ignoreOffer: boolean;
 	isSettingRemoteAnswerPending: boolean;
+	negotiationNeeded: boolean;      // coalesce rapid-fire onnegotiationneeded
+	negotiationInProgress: boolean;  // true while an offer is in-flight
 };
 
 export class Socket extends RootSocket {
 	private rtcpeers: Record<string, RTCPeer>;
 	private streamEvents: Record<string, any>; // Events Payloads including RTCIOStream, stream.id:event-payload
 	private signalingQueues: Record<string, Promise<void>>; // Per-peer serial queue
+	public debug: boolean;
 
 	private readonly servers = {
 		iceServers: [
@@ -47,6 +52,7 @@ export class Socket extends RootSocket {
 		this.rtcpeers = {};
 		this.streamEvents = {};
 		this.signalingQueues = {};
+		this.debug = opts?.debug ?? false;
 
 		this.on("#init-rtc-offer", this.initializeConnection);
 		this.on("#rtc-message", this.enqueueSignalingMessage);
@@ -60,6 +66,7 @@ export class Socket extends RootSocket {
 
 	// ─── Structured Logging ──────────────────────────────────────────────
 	private log(level: 'debug' | 'warn' | 'error', msg: string, data?: any) {
+		if (level === 'debug' && !this.debug) return;
 		const prefix = `[rtc-io][${this.id?.slice(-6) ?? '------'}]`;
 		console[level](`${prefix} ${msg}`, data ?? '');
 	}
@@ -144,7 +151,12 @@ export class Socket extends RootSocket {
 			// Stream replay happens AFTER the initial offer/answer exchange
 			// to prevent onnegotiationneeded from racing with setRemoteDescription.
 			peer = this.createPeerConnection(payload, { polite: false });
-			peer.connection.createDataChannel("connectionSetup");
+			// NOTE: Do NOT create a data channel here. The impolite side
+			// receives the data channel from the polite peer (who creates it
+			// in initializeConnection). Creating one here would fire
+			// onnegotiationneeded, causing the impolite side to send an offer
+			// that races with the incoming offer, leading to glare where
+			// subsequent offers carrying stream tracks get dropped.
 			isNewPeer = true;
 			this.log('debug', 'Created impolite peer (deferred stream replay)', { peer: source });
 		}
@@ -185,6 +197,13 @@ export class Socket extends RootSocket {
 					this.log('debug', 'Implicit rollback not supported, doing manual rollback', { peer: source });
 					await peer.connection.setLocalDescription({ type: "rollback" });
 					await peer.connection.setRemoteDescription(description);
+				} else if (
+					description.type === 'answer' &&
+					peer.connection.signalingState === 'stable'
+				) {
+					// Stale answer for a superseded offer — harmless, drop it.
+					this.log('debug', 'Dropping stale answer (already stable)', { peer: source });
+					return;
 				} else {
 					this.log('warn', `setRemoteDescription failed (state: ${peer.connection.signalingState})`, { peer: source, err: err?.message });
 					return;
@@ -206,10 +225,11 @@ export class Socket extends RootSocket {
 				this.log('debug', 'Sent answer', { peer: source });
 			}
 
-			// Now that signaling is stable, safe to add local tracks
-			// without onnegotiationneeded racing with the incoming offer.
+			// Now that signaling is stable, safe to add local tracks.
+			// Defer to next microtask so the current signaling handler
+			// finishes completely before onnegotiationneeded fires.
 			if (isNewPeer) {
-				this.replayStreamsToPeer(peer);
+				queueMicrotask(() => this.replayStreamsToPeer(peer));
 			}
 		} else if (candidate) {
 			try {
@@ -220,7 +240,12 @@ export class Socket extends RootSocket {
 		} else if (events) {
 			const rtcioStream = peer.streams[mid]; //id asil idden farkli.!
 
-			this.log('debug', 'Received stream events', { mid, events });
+			this.log('debug', 'Received stream events', { mid, events, hasStream: !!rtcioStream, peerStreamKeys: Object.keys(peer.streams) });
+
+			if (!rtcioStream) {
+				this.log('warn', 'Stream not found for events — stream not yet registered via ontrack', { mid, peerStreams: Object.keys(peer.streams) });
+				return;
+			}
 
 			Object.keys(events).forEach((key) => {
 				this.listeners(key).forEach((listener) => {
@@ -234,10 +259,13 @@ export class Socket extends RootSocket {
 			});
 		} else if (mid) {
 			const rtcioStream = peer.streams[mid];
-			if (!rtcioStream)
-				throw new Error(
-					`Transceiver with mid ${mid} not found in peer ${source}`,
-				);
+			if (!rtcioStream) {
+				this.log('warn', `Stream metadata request for unknown mid — peer may not have this stream yet`, {
+					mid, peer: source, peerStreams: Object.keys(peer.streams),
+					localStreamEvents: Object.keys(this.streamEvents),
+				});
+				return;
+			}
 
 			const events = this.streamEvents[rtcioStream.id];
 			if (!events) {
@@ -300,9 +328,6 @@ export class Socket extends RootSocket {
 				}
 			}
 
-			// Broadcast existing streams to the new peer
-			this.broadcastExistingStreams(peer);
-
 			this.log('debug', `Initialized ${options.polite ? 'polite' : 'impolite'} peer`, { peer: payload.source });
 		} catch (error) {
 			// eslint-disable-next-line no-console
@@ -312,33 +337,20 @@ export class Socket extends RootSocket {
 		}
 	}
 
-	private broadcastExistingStreams(newPeer: RTCPeer) {
-		// Get all existing peers except the new one
-		const existingPeers = Object.values(this.rtcpeers).filter(p => p.socketId !== newPeer.socketId);
-		
-		// For each existing peer, share their streams with the new peer
-		existingPeers.forEach(existingPeer => {
-			Object.values(existingPeer.streams).forEach(stream => {
-				if (stream.mediaStream) {
-					// Add the stream to streamEvents if it doesn't exist
-					if (!this.streamEvents[stream.id]) {
-						this.streamEvents[stream.id] = {};
-					}
-					this.addTransceiverToPeer(newPeer, stream);
-				}
-			});
-		});
-	}
-
 	serializeStreamEvent(data) {
 		if (data instanceof RTCIOStream) {
 			return data.toJSON();
 		}
 		try {
+			if (Array.isArray(data)) {
+				return data.map((item) => this.serializeStreamEvent(item));
+			}
 			if (data && typeof data === "object") {
+				const out: Record<string, any> = {};
 				for (const key in data) {
-					data[key] = this.serializeStreamEvent(data[key]);
+					out[key] = this.serializeStreamEvent(data[key]);
 				}
+				return out;
 			}
 		} catch (err) {
 			console.error(data);
@@ -380,24 +392,42 @@ export class Socket extends RootSocket {
 
 	// ─── Transceiver management: reuse idle + sendonly direction ─────────
 	addTransceiverToPeer(peer: RTCPeer, rtcioStream: RTCIOStream) {
+		const streamMsId = rtcioStream.mediaStream.id;
+
+		this.log('debug', 'addTransceiverToPeer', {
+			peer: peer.socketId,
+			rtcioStreamId: rtcioStream.id,
+			mediaStreamId: streamMsId,
+			trackCount: rtcioStream.mediaStream.getTracks().length,
+		});
+
 		// Store the stream reference even if it has no tracks
-		peer.streams[rtcioStream.mediaStream.id] = rtcioStream;
+		peer.streams[streamMsId] = rtcioStream;
+
+		// Initialise transceiver list for this stream if needed
+		if (!peer.streamTransceivers[streamMsId]) {
+			peer.streamTransceivers[streamMsId] = [];
+		}
 		
 		// Listen for track changes on this stream (e.g. user toggles camera)
 		rtcioStream.onTrackChanged((stream) => {
 			const tracks = stream.getTracks();
+			const ownTransceivers = peer.streamTransceivers[streamMsId] ?? [];
+
 			tracks.forEach(track => {
-				const existingTransceiver = peer.connection.getTransceivers().find(
+				// Only look at transceivers that belong to THIS stream
+				const existingTransceiver = ownTransceivers.find(
 					t => t.sender.track && t.sender.track.kind === track.kind
 				);
 				
 				if (existingTransceiver) {
 					existingTransceiver.sender.replaceTrack(track);
 				} else {
-					peer.connection.addTransceiver(track, {
+					const transceiver = peer.connection.addTransceiver(track, {
 						direction: "sendonly",
 						streams: [rtcioStream.mediaStream],
 					});
+					peer.streamTransceivers[streamMsId].push(transceiver);
 				}
 			});
 			// Browser fires onnegotiationneeded automatically after addTransceiver
@@ -406,34 +436,48 @@ export class Socket extends RootSocket {
 		const tracks = rtcioStream.mediaStream.getTracks();
 		if (tracks.length === 0) {
 			// Placeholder transceiver so the peer knows we have a stream slot
-			peer.connection.addTransceiver('audio', {
+			const transceiver = peer.connection.addTransceiver('audio', {
 				direction: "sendonly"
 			});
+			peer.streamTransceivers[streamMsId].push(transceiver);
 			return;
 		}
 
 		tracks.forEach((track) => {
 			if (track.kind === 'audio' || track.kind === 'video') {
 				// Reuse existing idle transceiver (sender.track === null, same kind)
-				// instead of always creating a new one — prevents transceiver accumulation
+				// instead of always creating a new one — prevents transceiver accumulation.
+				// Only consider transceivers NOT already claimed by another stream.
+				const claimedTransceiverIds = new Set(
+					Object.values(peer.streamTransceivers).flat().map(t => t.mid)
+				);
+
 				const idle = peer.connection.getTransceivers().find(
 					t => t.sender.track === null
 						&& t.receiver.track?.kind === track.kind
 						&& (t.direction === 'sendonly' || t.direction === 'sendrecv' || t.direction === 'inactive')
+						&& !claimedTransceiverIds.has(t.mid)
 				);
 
 				if (idle) {
 					idle.sender.replaceTrack(track);
 					idle.direction = "sendonly";
+					// CRITICAL: update the stream association so the remote
+					// ontrack receives the correct streams[0].id (a=msid: in SDP).
+					// Without this, the reused transceiver keeps its old msid and
+					// the remote peer cannot look up the stream for event metadata.
+					if (idle.sender.setStreams) {
+						idle.sender.setStreams(rtcioStream.mediaStream);
+					}
+					peer.streamTransceivers[streamMsId].push(idle);
 					this.log('debug', 'Reused idle transceiver', { kind: track.kind, peer: peer.socketId });
 				} else {
-					peer.connection.addTransceiver(track, {
+					const transceiver = peer.connection.addTransceiver(track, {
 						direction: "sendonly",
 						streams: [rtcioStream.mediaStream],
 					});
+					peer.streamTransceivers[streamMsId].push(transceiver);
 				}
-
-				peer.streams[rtcioStream.mediaStream.id] = rtcioStream;
 			}
 		});
 	}
@@ -452,12 +496,15 @@ export class Socket extends RootSocket {
 		this.rtcpeers[source] = {
 			connection: peerConnection,
 			streams: {},
+			streamTransceivers: {},
 			socketId: source,
 			polite: options.polite,
 			connectionStatus: {
 				makingOffer: false,
 				ignoreOffer: false,
 				isSettingRemoteAnswerPending: false,
+				negotiationNeeded: false,
+				negotiationInProgress: false,
 			},
 		};
 
@@ -596,30 +643,48 @@ export class Socket extends RootSocket {
 
 		// ── W3C Perfect Negotiation: onnegotiationneeded ─────────────────
 		// Reference: https://w3c.github.io/webrtc-pc/#perfect-negotiation-example
-		// The spec does NOT check signalingState before making an offer.
-		// It relies solely on makingOffer + the collision detection in
-		// handleCallServiceMessage to resolve glare.
+		// Coalesced: when multiple transceivers are added in the same tick
+		// (e.g. data-channel + cam + screen), the browser may fire
+		// onnegotiationneeded for each one. We coalesce them into a
+		// single offer round to avoid "answer in stable state" errors
+		// caused by remote answers arriving for superseded offers.
 		peer.connection.onnegotiationneeded = async () => {
-			try {
-				peer.connectionStatus.makingOffer = true;
-				this.log('debug', 'onnegotiationneeded — creating offer', { peer: source });
+			peer.connectionStatus.negotiationNeeded = true;
 
-				// Implicit SDP creation: setLocalDescription() with no args
-				// creates the correct offer/answer based on current state.
-				await peer.connection.setLocalDescription();
+			// If we're already in the middle of a negotiation round,
+			// just mark the flag — the finally block will re-trigger.
+			if (peer.connectionStatus.negotiationInProgress) {
+				this.log('debug', 'onnegotiationneeded coalesced (negotiation in progress)', { peer: source });
+				return;
+			}
 
-				this.emit("#rtc-message", {
-					target: peer.socketId,
-					source: this.id,
-					data: {
-						description: peer.connection.localDescription,
-					},
-				});
-				this.log('debug', 'Sent offer', { peer: source });
-			} catch (error: any) {
-				this.log('error', `onnegotiationneeded error: ${error?.message}`, { peer: source });
-			} finally {
-				peer.connectionStatus.makingOffer = false;
+			// Yield to allow further synchronous addTransceiver calls to
+			// set the flag before we start the offer.
+			await Promise.resolve();
+
+			while (peer.connectionStatus.negotiationNeeded) {
+				peer.connectionStatus.negotiationNeeded = false;
+				peer.connectionStatus.negotiationInProgress = true;
+				try {
+					peer.connectionStatus.makingOffer = true;
+					this.log('debug', 'onnegotiationneeded — creating offer', { peer: source });
+
+					await peer.connection.setLocalDescription();
+
+					this.emit("#rtc-message", {
+						target: peer.socketId,
+						source: this.id,
+						data: {
+							description: peer.connection.localDescription,
+						},
+					});
+					this.log('debug', 'Sent offer', { peer: source });
+				} catch (error: any) {
+					this.log('error', `onnegotiationneeded error: ${error?.message}`, { peer: source });
+				} finally {
+					peer.connectionStatus.makingOffer = false;
+					peer.connectionStatus.negotiationInProgress = false;
+				}
 			}
 		};
 

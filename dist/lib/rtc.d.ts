@@ -4,6 +4,7 @@ import { MessagePayload } from "./payload";
 import { RTCIOStream } from "./stream";
 export interface SocketOptions extends Partial<RootSocketOptions> {
     iceServers: RTCIceServer[];
+    debug?: boolean;
 }
 type RTCPeer = {
     connection: RTCPeerConnection;
@@ -11,16 +12,20 @@ type RTCPeer = {
     polite: boolean;
     connectionStatus: connectionStatus;
     streams: Record<string, RTCIOStream>;
+    streamTransceivers: Record<string, RTCRtpTransceiver[]>;
 };
 type connectionStatus = {
     makingOffer: boolean;
     ignoreOffer: boolean;
     isSettingRemoteAnswerPending: boolean;
+    negotiationNeeded: boolean;
+    negotiationInProgress: boolean;
 };
 export declare class Socket extends RootSocket {
     private rtcpeers;
     private streamEvents;
     private signalingQueues;
+    debug: boolean;
     private readonly servers;
     constructor(io: Manager, nsp: string, opts?: Partial<SocketOptions>);
     private log;
@@ -39,7 +44,6 @@ export declare class Socket extends RootSocket {
     initializeConnection(payload: MessagePayload, options?: {
         polite: boolean;
     }): RTCPeer;
-    private broadcastExistingStreams;
     serializeStreamEvent(data: any): any;
     deserializeStreamEvent(data: any, rtcioStream: RTCIOStream): any;
     addTransceiverToPeer(peer: RTCPeer, rtcioStream: RTCIOStream): void;
