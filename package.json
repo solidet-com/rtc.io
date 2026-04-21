@@ -29,7 +29,9 @@
 		"io"
 	],
 	"scripts": {
-		"build": "tsc -p tsconfig.cjs.json && tsc -p tsconfig.esm.json"
+		"build": "tsc -p tsconfig.cjs.json && tsc -p tsconfig.esm.json",
+		"test":  "vitest run",
+		"test:watch": "vitest"
 	},
 	"dependencies": {
 		"socket.io-client": "^4.7.4",
@@ -38,7 +40,9 @@
 	"devDependencies": {
 		"@types/node": "^16.11.7",
 		"prettier": "^3.0.3",
+		"socket.io": "^4.7.4",
 		"tsc": "^2.0.4",
-		"typescript": "^5.8.2"
+		"typescript": "^5.8.2",
+		"vitest": "^2.0.0"
 	}
 }

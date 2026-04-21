@@ -1,16 +1,12 @@
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.RTCIOStream = void 0;
-const uuid_1 = require("uuid");
-class RTCIOStream {
+import { v4 as uuid } from "uuid";
+export class RTCIOStream {
     constructor(idOrMediaStream, mediaStream) {
         this.trackChangeCallbacks = [];
         this.onTrackChange = () => {
             this.trackChangeCallbacks.forEach(callback => callback(this.mediaStream));
         };
-        console.log(idOrMediaStream, idOrMediaStream instanceof MediaStream);
         if (idOrMediaStream instanceof MediaStream) {
-            this.id = (0, uuid_1.v4)();
+            this.id = uuid();
             this.mediaStream = idOrMediaStream;
         }
         else {
@@ -45,4 +41,3 @@ class RTCIOStream {
         return `[RTCIOStream] ${this.id}`;
     }
 }
-exports.RTCIOStream = RTCIOStream;

@@ -6,18 +6,8 @@ const stats_js_1 = require("./stats/stats.js");
 const stream_1 = require("./stream");
 class Socket extends socket_io_client_1.Socket {
     constructor(io, nsp, opts) {
-        var _a;
+        var _a, _b;
         super(io, nsp, opts);
-        this.servers = {
-            iceServers: [
-                {
-                    urls: [
-                        "stun:stun1.l.google.com:19302",
-                        "stun:stun2.l.google.com:19302",
-                    ],
-                },
-            ],
-        };
         // ─── Signaling serialization: per-peer async queue ───────────────────
         // Prevents two signaling messages from interleaving their async steps
         // (e.g. two offers arriving back-to-back, or an offer + answer crossing).
@@ -28,6 +18,87 @@ class Socket extends socket_io_client_1.Socket {
             this.signalingQueues[peerId] = prev.then(() => this.handleCallServiceMessage(payload).catch((err) => {
                 this.log('error', 'Signaling error', { peer: peerId, err });
             }));
+        };
+        // ─── Transceiver management: reuse idle + sendonly direction ─────────
+        this.addTransceiverToPeer = (peer, rtcioStream) => {
+            const streamMsId = rtcioStream.mediaStream.id;
+            this.log('debug', 'addTransceiverToPeer', {
+                peer: peer.socketId,
+                rtcioStreamId: rtcioStream.id,
+                mediaStreamId: streamMsId,
+                trackCount: rtcioStream.mediaStream.getTracks().length,
+            });
+            // Store the stream reference even if it has no tracks
+            peer.streams[streamMsId] = rtcioStream;
+            // Initialise transceiver list for this stream if needed
+            if (!peer.streamTransceivers[streamMsId]) {
+                peer.streamTransceivers[streamMsId] = [];
+            }
+            // Listen for track changes on this stream (e.g. user toggles camera)
+            rtcioStream.onTrackChanged((stream) => {
+                var _a;
+                const tracks = stream.getTracks();
+                const ownTransceivers = (_a = peer.streamTransceivers[streamMsId]) !== null && _a !== void 0 ? _a : [];
+                tracks.forEach(track => {
+                    // Only look at transceivers that belong to THIS stream
+                    const existingTransceiver = ownTransceivers.find(t => t.sender.track && t.sender.track.kind === track.kind);
+                    if (existingTransceiver) {
+                        existingTransceiver.sender.replaceTrack(track);
+                    }
+                    else {
+                        const transceiver = peer.connection.addTransceiver(track, {
+                            direction: "sendonly",
+                            streams: [rtcioStream.mediaStream],
+                        });
+                        peer.streamTransceivers[streamMsId].push(transceiver);
+                    }
+                });
+                // Browser fires onnegotiationneeded automatically after addTransceiver
+            });
+            const tracks = rtcioStream.mediaStream.getTracks();
+            if (tracks.length === 0) {
+                // Placeholder transceiver so the peer knows we have a stream slot
+                const transceiver = peer.connection.addTransceiver('audio', {
+                    direction: "sendonly"
+                });
+                peer.streamTransceivers[streamMsId].push(transceiver);
+                return;
+            }
+            tracks.forEach((track) => {
+                {
+                    // Reuse existing idle transceiver (sender.track === null, same kind)
+                    // instead of always creating a new one — prevents transceiver accumulation.
+                    // Only consider transceivers NOT already claimed by another stream.
+                    const claimedTransceiverIds = new Set(Object.values(peer.streamTransceivers).flat().map(t => t.mid));
+                    const idle = peer.connection.getTransceivers().find(t => {
+                        var _a;
+                        return t.sender.track === null
+                            && ((_a = t.receiver.track) === null || _a === void 0 ? void 0 : _a.kind) === track.kind
+                            && (t.direction === 'sendonly' || t.direction === 'sendrecv' || t.direction === 'inactive')
+                            && !claimedTransceiverIds.has(t.mid);
+                    });
+                    if (idle) {
+                        idle.sender.replaceTrack(track);
+                        idle.direction = "sendonly";
+                        // CRITICAL: update the stream association so the remote
+                        // ontrack receives the correct streams[0].id (a=msid: in SDP).
+                        // Without this, the reused transceiver keeps its old msid and
+                        // the remote peer cannot look up the stream for event metadata.
+                        if (idle.sender.setStreams) {
+                            idle.sender.setStreams(rtcioStream.mediaStream);
+                        }
+                        peer.streamTransceivers[streamMsId].push(idle);
+                        this.log('debug', 'Reused idle transceiver', { kind: track.kind, peer: peer.socketId });
+                    }
+                    else {
+                        const transceiver = peer.connection.addTransceiver(track, {
+                            direction: "sendonly",
+                            streams: [rtcioStream.mediaStream],
+                        });
+                        peer.streamTransceivers[streamMsId].push(transceiver);
+                    }
+                }
+            });
         };
         /**
          * Creates peer connection
@@ -216,10 +287,15 @@ class Socket extends socket_io_client_1.Socket {
                 cb.call(this, peer, ...args);
             });
         };
+        this.servers = {
+            iceServers: ((_a = opts === null || opts === void 0 ? void 0 : opts.iceServers) === null || _a === void 0 ? void 0 : _a.length)
+                ? opts.iceServers
+                : [{ urls: ["stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"] }],
+        };
         this.rtcpeers = {};
         this.streamEvents = {};
         this.signalingQueues = {};
-        this.debug = (_a = opts === null || opts === void 0 ? void 0 : opts.debug) !== null && _a !== void 0 ? _a : false;
+        this.debug = (_b = opts === null || opts === void 0 ? void 0 : opts.debug) !== null && _b !== void 0 ? _b : false;
         this.on("#init-rtc-offer", this.initializeConnection);
         this.on("#rtc-message", this.enqueueSignalingMessage);
         /*
@@ -253,9 +329,10 @@ class Socket extends socket_io_client_1.Socket {
             //  }
             // }
             this.log('debug', `emit stream event: ${ev}`, { streamId: stream.id });
-            this.streamEvents[stream.id] = {
-                [ev]: args,
-            };
+            if (!this.streamEvents[stream.id]) {
+                this.streamEvents[stream.id] = {};
+            }
+            this.streamEvents[stream.id][ev] = args;
             this.broadcastPeers(this.addTransceiverToPeer, stream);
         }
         else {
@@ -388,10 +465,11 @@ class Socket extends socket_io_client_1.Socket {
             }
             Object.keys(events).forEach((key) => {
                 this.listeners(key).forEach((listener) => {
-                    const subEvents = events[key];
-                    subEvents.forEach((subEvent) => {
-                        listener(this.deserializeStreamEvent(subEvent, rtcioStream));
-                    });
+                    // Deserialize the full args array, then spread — mirrors how socket.io
+                    // dispatches events and correctly handles multi-arg emits.
+                    // .call(this) so once wrappers can call this.off() to unsubscribe.
+                    const args = events[key].map((arg) => this.deserializeStreamEvent(arg, rtcioStream));
+                    listener.call(this, ...args);
                 });
             });
         }
@@ -405,15 +483,19 @@ class Socket extends socket_io_client_1.Socket {
                 return;
             }
             const events = this.streamEvents[rtcioStream.id];
-            if (!events) {
-                this.streamEvents[rtcioStream.id] = {};
+            if (!events || Object.keys(events).length === 0) {
+                // No events registered yet — don't send an empty response.
+                // The receiver already has the stream via ontrack; when the sender
+                // calls emit() later, replayStreamsToPeer will push events at that point.
+                this.log('debug', 'No events for stream yet, skipping metadata response', { mid });
+                return;
             }
             const payload = {
                 source: this.id,
                 target: peer.socketId,
                 data: this.serializeStreamEvent({
                     mid,
-                    events: this.streamEvents[rtcioStream.id],
+                    events,
                 }),
             };
             this.emit("#rtc-message", payload);
@@ -458,8 +540,7 @@ class Socket extends socket_io_client_1.Socket {
             this.log('debug', `Initialized ${options.polite ? 'polite' : 'impolite'} peer`, { peer: payload.source });
         }
         catch (error) {
-            // eslint-disable-next-line no-console
-            console.error(error);
+            this.log('error', 'initializeConnection failed', { error });
         }
         finally {
             return this.getPeer(payload.source);
@@ -482,7 +563,7 @@ class Socket extends socket_io_client_1.Socket {
             }
         }
         catch (err) {
-            console.error(data);
+            this.log('error', 'serializeStreamEvent failed', { err });
         }
         return data;
     }
@@ -505,90 +586,9 @@ class Socket extends socket_io_client_1.Socket {
             }
         }
         catch (err) {
-            console.error(data);
+            this.log('error', 'deserializeStreamEvent failed', { err });
         }
         return data;
-    }
-    // ─── Transceiver management: reuse idle + sendonly direction ─────────
-    addTransceiverToPeer(peer, rtcioStream) {
-        const streamMsId = rtcioStream.mediaStream.id;
-        this.log('debug', 'addTransceiverToPeer', {
-            peer: peer.socketId,
-            rtcioStreamId: rtcioStream.id,
-            mediaStreamId: streamMsId,
-            trackCount: rtcioStream.mediaStream.getTracks().length,
-        });
-        // Store the stream reference even if it has no tracks
-        peer.streams[streamMsId] = rtcioStream;
-        // Initialise transceiver list for this stream if needed
-        if (!peer.streamTransceivers[streamMsId]) {
-            peer.streamTransceivers[streamMsId] = [];
-        }
-        // Listen for track changes on this stream (e.g. user toggles camera)
-        rtcioStream.onTrackChanged((stream) => {
-            var _a;
-            const tracks = stream.getTracks();
-            const ownTransceivers = (_a = peer.streamTransceivers[streamMsId]) !== null && _a !== void 0 ? _a : [];
-            tracks.forEach(track => {
-                // Only look at transceivers that belong to THIS stream
-                const existingTransceiver = ownTransceivers.find(t => t.sender.track && t.sender.track.kind === track.kind);
-                if (existingTransceiver) {
-                    existingTransceiver.sender.replaceTrack(track);
-                }
-                else {
-                    const transceiver = peer.connection.addTransceiver(track, {
-                        direction: "sendonly",
-                        streams: [rtcioStream.mediaStream],
-                    });
-                    peer.streamTransceivers[streamMsId].push(transceiver);
-                }
-            });
-            // Browser fires onnegotiationneeded automatically after addTransceiver
-        });
-        const tracks = rtcioStream.mediaStream.getTracks();
-        if (tracks.length === 0) {
-            // Placeholder transceiver so the peer knows we have a stream slot
-            const transceiver = peer.connection.addTransceiver('audio', {
-                direction: "sendonly"
-            });
-            peer.streamTransceivers[streamMsId].push(transceiver);
-            return;
-        }
-        tracks.forEach((track) => {
-            if (track.kind === 'audio' || track.kind === 'video') {
-                // Reuse existing idle transceiver (sender.track === null, same kind)
-                // instead of always creating a new one — prevents transceiver accumulation.
-                // Only consider transceivers NOT already claimed by another stream.
-                const claimedTransceiverIds = new Set(Object.values(peer.streamTransceivers).flat().map(t => t.mid));
-                const idle = peer.connection.getTransceivers().find(t => {
-                    var _a;
-                    return t.sender.track === null
-                        && ((_a = t.receiver.track) === null || _a === void 0 ? void 0 : _a.kind) === track.kind
-                        && (t.direction === 'sendonly' || t.direction === 'sendrecv' || t.direction === 'inactive')
-                        && !claimedTransceiverIds.has(t.mid);
-                });
-                if (idle) {
-                    idle.sender.replaceTrack(track);
-                    idle.direction = "sendonly";
-                    // CRITICAL: update the stream association so the remote
-                    // ontrack receives the correct streams[0].id (a=msid: in SDP).
-                    // Without this, the reused transceiver keeps its old msid and
-                    // the remote peer cannot look up the stream for event metadata.
-                    if (idle.sender.setStreams) {
-                        idle.sender.setStreams(rtcioStream.mediaStream);
-                    }
-                    peer.streamTransceivers[streamMsId].push(idle);
-                    this.log('debug', 'Reused idle transceiver', { kind: track.kind, peer: peer.socketId });
-                }
-                else {
-                    const transceiver = peer.connection.addTransceiver(track, {
-                        direction: "sendonly",
-                        streams: [rtcioStream.mediaStream],
-                    });
-                    peer.streamTransceivers[streamMsId].push(transceiver);
-                }
-            }
-        });
     }
     // ─── Centralized peer cleanup ────────────────────────────────────
     // Closes the connection, removes all references, and notifies

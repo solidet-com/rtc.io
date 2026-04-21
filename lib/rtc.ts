@@ -247,12 +247,13 @@ export class Socket extends RootSocket {
 
 			Object.keys(events).forEach((key) => {
 				this.listeners(key).forEach((listener) => {
-					const subEvents: any[] = events[key];
-					subEvents.forEach((subEvent: any) => {
-						listener(
-							this.deserializeStreamEvent(subEvent, rtcioStream),
-						);
-					});
+					// Deserialize the full args array, then spread — mirrors how socket.io
+					// dispatches events and correctly handles multi-arg emits.
+					// .call(this) so once wrappers can call this.off() to unsubscribe.
+					const args = (events[key] as any[]).map(
+						(arg: any) => this.deserializeStreamEvent(arg, rtcioStream),
+					);
+					(listener as Function).call(this, ...args);
 				});
 			});
 		} else if (mid) {
@@ -266,8 +267,12 @@ export class Socket extends RootSocket {
 			}
 
 			const events = this.streamEvents[rtcioStream.id];
-			if (!events) {
-				this.streamEvents[rtcioStream.id] = {};
+			if (!events || Object.keys(events).length === 0) {
+				// No events registered yet — don't send an empty response.
+				// The receiver already has the stream via ontrack; when the sender
+				// calls emit() later, replayStreamsToPeer will push events at that point.
+				this.log('debug', 'No events for stream yet, skipping metadata response', { mid });
+				return;
 			}
 
 			const payload: GetEventPayload = {
@@ -275,7 +280,7 @@ export class Socket extends RootSocket {
 				target: peer.socketId,
 				data: this.serializeStreamEvent({
 					mid,
-					events: this.streamEvents[rtcioStream.id],
+					events,
 				}),
 			};
 
@@ -441,7 +446,7 @@ export class Socket extends RootSocket {
 		}
 
 		tracks.forEach((track) => {
-			if (track.kind === 'audio' || track.kind === 'video') {
+			{
 				// Reuse existing idle transceiver (sender.track === null, same kind)
 				// instead of always creating a new one — prevents transceiver accumulation.
 				// Only consider transceivers NOT already claimed by another stream.

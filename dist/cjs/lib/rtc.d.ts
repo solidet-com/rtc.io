@@ -29,7 +29,7 @@ export declare class Socket extends RootSocket {
     private readonly servers;
     constructor(io: Manager, nsp: string, opts?: Partial<SocketOptions>);
     private log;
-    emit(ev: any, ...args: any[]): this;
+    emit(ev: string, ...args: any[]): this;
     private getRTCIOStreamDeep;
     getPeer(id: string): RTCPeer;
     private enqueueSignalingMessage;
@@ -46,7 +46,7 @@ export declare class Socket extends RootSocket {
     }): RTCPeer;
     serializeStreamEvent(data: any): any;
     deserializeStreamEvent(data: any, rtcioStream: RTCIOStream): any;
-    addTransceiverToPeer(peer: RTCPeer, rtcioStream: RTCIOStream): void;
+    private addTransceiverToPeer;
     /**
      * Creates peer connection
      * @returns {RTCPeerConnection} instance of RTCPeerConnection.

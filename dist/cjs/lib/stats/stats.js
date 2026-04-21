@@ -191,7 +191,6 @@ function createRTCSample(statsReport) {
         localAddress: localCandidate && localCandidate.ip,
         remoteAddress: remoteCandidate && remoteCandidate.ip,
     });
-    console.log("sample", sample);
     return sample;
 }
 module.exports = {
