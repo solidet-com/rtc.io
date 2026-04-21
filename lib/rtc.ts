@@ -35,19 +35,16 @@ export class Socket extends RootSocket {
 	private signalingQueues: Record<string, Promise<void>>; // Per-peer serial queue
 	public debug: boolean;
 
-	private readonly servers = {
-		iceServers: [
-			{
-				urls: [
-					"stun:stun1.l.google.com:19302",
-					"stun:stun2.l.google.com:19302",
-				],
-			},
-		],
-	};
+	private readonly servers: RTCConfiguration;
 
 	constructor(io: Manager, nsp: string, opts?: Partial<SocketOptions>) {
 		super(io, nsp, opts);
+
+		this.servers = {
+			iceServers: opts?.iceServers?.length
+				? opts.iceServers
+				: [{ urls: ["stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"] }],
+		};
 
 		this.rtcpeers = {};
 		this.streamEvents = {};
@@ -71,7 +68,7 @@ export class Socket extends RootSocket {
 		console[level](`${prefix} ${msg}`, data ?? '');
 	}
 
-	emit(ev, ...args): this {
+	emit(ev: string, ...args: any[]): this {
 		const stream = this.getRTCIOStreamDeep(args);
 		if (stream) {
 			/**
@@ -90,9 +87,10 @@ export class Socket extends RootSocket {
 			// }
 
 			this.log('debug', `emit stream event: ${ev}`, { streamId: stream.id });
-			this.streamEvents[stream.id] = {
-				[ev]: args,
-			};
+			if (!this.streamEvents[stream.id]) {
+				this.streamEvents[stream.id] = {};
+			}
+			this.streamEvents[stream.id][ev] = args;
 
 			this.broadcastPeers(this.addTransceiverToPeer, stream);
 		} else {
@@ -249,8 +247,8 @@ export class Socket extends RootSocket {
 
 			Object.keys(events).forEach((key) => {
 				this.listeners(key).forEach((listener) => {
-					const subEvents = events[key];
-					subEvents.forEach((subEvent) => {
+					const subEvents: any[] = events[key];
+					subEvents.forEach((subEvent: any) => {
 						listener(
 							this.deserializeStreamEvent(subEvent, rtcioStream),
 						);
@@ -330,14 +328,13 @@ export class Socket extends RootSocket {
 
 			this.log('debug', `Initialized ${options.polite ? 'polite' : 'impolite'} peer`, { peer: payload.source });
 		} catch (error) {
-			// eslint-disable-next-line no-console
-			console.error(error);
+			this.log('error', 'initializeConnection failed', { error });
 		} finally {
 			return this.getPeer(payload.source);
 		}
 	}
 
-	serializeStreamEvent(data) {
+	serializeStreamEvent(data: any): any {
 		if (data instanceof RTCIOStream) {
 			return data.toJSON();
 		}
@@ -353,7 +350,7 @@ export class Socket extends RootSocket {
 				return out;
 			}
 		} catch (err) {
-			console.error(data);
+			this.log('error', 'serializeStreamEvent failed', { err });
 		}
 
 		return data;
@@ -384,14 +381,14 @@ export class Socket extends RootSocket {
 				//media streamin'id sini looplayacak konuma geliyor
 			}
 		} catch (err) {
-			console.error(data);
+			this.log('error', 'deserializeStreamEvent failed', { err });
 		}
 
 		return data;
 	}
 
 	// ─── Transceiver management: reuse idle + sendonly direction ─────────
-	addTransceiverToPeer(peer: RTCPeer, rtcioStream: RTCIOStream) {
+	private addTransceiverToPeer = (peer: RTCPeer, rtcioStream: RTCIOStream): void => {
 		const streamMsId = rtcioStream.mediaStream.id;
 
 		this.log('debug', 'addTransceiverToPeer', {

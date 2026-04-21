@@ -1,22 +1,13 @@
 {
 	"compilerOptions": {
 		"target": "es2017",
-		"module": "commonjs",
 		"strict": true,
 		"esModuleInterop": true,
-		"noImplicitAny": false,
-
 		"declaration": true,
-
-		"incremental": true,
 		"skipLibCheck": true,
-
-		"noImplicitThis": false,
-		"strictPropertyInitialization": false,
 		"noImplicitReturns": true,
-		"outDir": "dist",
 		"allowJs": true
 	},
 	"include": ["lib/**/*", "index.ts"],
-	"exclude": ["node_modules"]
+	"exclude": ["node_modules", "lib/stats"]
 }

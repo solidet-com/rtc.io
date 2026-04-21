@@ -11,7 +11,6 @@ export class RTCIOStream {
 		idOrMediaStream: string | MediaStream,
 		mediaStream?: MediaStream,
 	) {
-		console.log(idOrMediaStream, idOrMediaStream instanceof MediaStream);
 		if (idOrMediaStream instanceof MediaStream) {
 			this.id = uuid();
 			this.mediaStream = idOrMediaStream!;
