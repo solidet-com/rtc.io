@@ -1,7 +1,7 @@
 {
 	"name": "rtc.io",
 	"version": "1.0.0",
-	"description": "WebRTC + socket.io components for Node.js",
+	"description": "WebRTC + socket.io components",
 	"main": "dist/cjs/index.js",
 	"module": "dist/esm/index.js",
 	"types": "dist/cjs/index.d.ts",
