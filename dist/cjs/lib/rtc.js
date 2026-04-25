@@ -4,13 +4,12 @@ exports.Socket = void 0;
 const socket_io_client_1 = require("socket.io-client");
 const stats_js_1 = require("./stats/stats.js");
 const stream_1 = require("./stream");
+const events_1 = require("./events");
 class Socket extends socket_io_client_1.Socket {
     constructor(io, nsp, opts) {
         var _a, _b;
         super(io, nsp, opts);
-        // ─── Signaling serialization: per-peer async queue ───────────────────
-        // Prevents two signaling messages from interleaving their async steps
-        // (e.g. two offers arriving back-to-back, or an offer + answer crossing).
+        // Serializes signaling per peer — prevents concurrent messages from interleaving async steps.
         this.enqueueSignalingMessage = (payload) => {
             var _a;
             const peerId = payload.source;
@@ -19,7 +18,6 @@ class Socket extends socket_io_client_1.Socket {
                 this.log('error', 'Signaling error', { peer: peerId, err });
             }));
         };
-        // ─── Transceiver management: reuse idle + sendonly direction ─────────
         this.addTransceiverToPeer = (peer, rtcioStream) => {
             const streamMsId = rtcioStream.mediaStream.id;
             this.log('debug', 'addTransceiverToPeer', {
@@ -66,9 +64,7 @@ class Socket extends socket_io_client_1.Socket {
             }
             tracks.forEach((track) => {
                 {
-                    // Reuse existing idle transceiver (sender.track === null, same kind)
-                    // instead of always creating a new one — prevents transceiver accumulation.
-                    // Only consider transceivers NOT already claimed by another stream.
+                    // Reuse an unclaimed idle transceiver of the same kind to prevent accumulation.
                     const claimedTransceiverIds = new Set(Object.values(peer.streamTransceivers).flat().map(t => t.mid));
                     const idle = peer.connection.getTransceivers().find(t => {
                         var _a;
@@ -80,10 +76,7 @@ class Socket extends socket_io_client_1.Socket {
                     if (idle) {
                         idle.sender.replaceTrack(track);
                         idle.direction = "sendonly";
-                        // CRITICAL: update the stream association so the remote
-                        // ontrack receives the correct streams[0].id (a=msid: in SDP).
-                        // Without this, the reused transceiver keeps its old msid and
-                        // the remote peer cannot look up the stream for event metadata.
+                        // setStreams updates a=msid in SDP so the remote ontrack receives the correct stream id.
                         if (idle.sender.setStreams) {
                             idle.sender.setStreams(rtcioStream.mediaStream);
                         }
@@ -121,13 +114,9 @@ class Socket extends socket_io_client_1.Socket {
                     negotiationInProgress: false,
                 },
             };
-            //webcam transceiver,
-            //screen share transceiver
             const peer = this.rtcpeers[source];
             this.log('debug', `Created peer connection`, { peer: source, polite: options.polite });
-            // ─── ontrack: handle incoming remote tracks ──────────────────────
-            // Uses stream.onaddtrack for late-arriving tracks instead of timers.
-            // Handles empty streams array by creating a synthetic stream.
+            // Uses stream.onaddtrack for late-arriving tracks; creates a synthetic stream if streams[] is empty.
             peer.connection.ontrack = ({ transceiver, track, streams }) => {
                 let stream = streams[0];
                 // Handle empty streams array — create synthetic MediaStream
@@ -152,7 +141,6 @@ class Socket extends socket_io_client_1.Socket {
                     if (!existingStream.getTrackById(track.id)) {
                         existingStream.addTrack(track);
                     }
-                    // Notify about track addition
                     this.listeners("track-added").forEach((listener) => {
                         listener({
                             peerId: source,
@@ -162,11 +150,8 @@ class Socket extends socket_io_client_1.Socket {
                     });
                     return;
                 }
-                // New stream — register it
                 peer.streams[stream.id] = new stream_1.RTCIOStream(stream);
-                // Bug #3: Listen for future tracks arriving on this same stream.
-                // The browser fires 'addtrack' when a new track is associated with
-                // this MediaStream (e.g., video arriving after audio).
+                // Handle tracks that arrive after the initial ontrack (e.g. video after audio).
                 stream.onaddtrack = ({ track: newTrack }) => {
                     this.log('debug', 'Late track arrived via stream.onaddtrack', {
                         peer: source, kind: newTrack.kind, streamId: stream.id,
@@ -187,16 +172,13 @@ class Socket extends socket_io_client_1.Socket {
                         mid: stream.id,
                     },
                 };
-                this.emit("#rtc-message", eventPayload);
+                this.emit(events_1.RtcioEvents.MESSAGE, eventPayload);
             };
-            // ─── ICE state machine ──────────────────────────────────────────
-            // 'disconnected' is transient and will auto-recover or transition to 'failed'.
+            // 'disconnected' is transient — ICE will self-recover or escalate to 'failed'.
             peer.connection.oniceconnectionstatechange = () => {
                 this.log('debug', `ICE state: ${peer.connection.iceConnectionState}`, { peer: source });
                 switch (peer.connection.iceConnectionState) {
                     case "disconnected":
-                        // Transient state — do nothing. ICE will self-recover
-                        // or transition to 'failed' if unrecoverable.
                         break;
                     case "failed":
                         peer.connection.restartIce();
@@ -232,26 +214,17 @@ class Socket extends socket_io_client_1.Socket {
                             candidate: event.candidate,
                         },
                     };
-                    this.emit("#rtc-message", payload);
+                    this.emit(events_1.RtcioEvents.MESSAGE, payload);
                 }
             };
-            // ── W3C Perfect Negotiation: onnegotiationneeded ─────────────────
-            // Reference: https://w3c.github.io/webrtc-pc/#perfect-negotiation-example
-            // Coalesced: when multiple transceivers are added in the same tick
-            // (e.g. data-channel + cam + screen), the browser may fire
-            // onnegotiationneeded for each one. We coalesce them into a
-            // single offer round to avoid "answer in stable state" errors
-            // caused by remote answers arriving for superseded offers.
+            // Coalesces rapid-fire onnegotiationneeded into a single offer round.
             peer.connection.onnegotiationneeded = async () => {
                 peer.connectionStatus.negotiationNeeded = true;
-                // If we're already in the middle of a negotiation round,
-                // just mark the flag — the finally block will re-trigger.
                 if (peer.connectionStatus.negotiationInProgress) {
                     this.log('debug', 'onnegotiationneeded coalesced (negotiation in progress)', { peer: source });
                     return;
                 }
-                // Yield to allow further synchronous addTransceiver calls to
-                // set the flag before we start the offer.
+                // Yield so any synchronous addTransceiver calls in the same tick set the flag first.
                 await Promise.resolve();
                 while (peer.connectionStatus.negotiationNeeded) {
                     peer.connectionStatus.negotiationNeeded = false;
@@ -260,7 +233,7 @@ class Socket extends socket_io_client_1.Socket {
                         peer.connectionStatus.makingOffer = true;
                         this.log('debug', 'onnegotiationneeded — creating offer', { peer: source });
                         await peer.connection.setLocalDescription();
-                        this.emit("#rtc-message", {
+                        this.emit(events_1.RtcioEvents.MESSAGE, {
                             target: peer.socketId,
                             source: this.id,
                             data: {
@@ -296,15 +269,9 @@ class Socket extends socket_io_client_1.Socket {
         this.streamEvents = {};
         this.signalingQueues = {};
         this.debug = (_b = opts === null || opts === void 0 ? void 0 : opts.debug) !== null && _b !== void 0 ? _b : false;
-        this.on("#init-rtc-offer", this.initializeConnection);
-        this.on("#rtc-message", this.enqueueSignalingMessage);
-        /*
-        this.on("#offer", this.createAnswer);
-        this.on("#answer", this.addAnswer);
-        this.on("#candidate", this.addIceCandidate);
-        */
+        this.on(events_1.RtcioEvents.INIT_OFFER, this.initializeConnection);
+        this.on(events_1.RtcioEvents.MESSAGE, this.enqueueSignalingMessage);
     }
-    // ─── Structured Logging ──────────────────────────────────────────────
     log(level, msg, data) {
         var _a, _b;
         if (level === 'debug' && !this.debug)
@@ -315,19 +282,6 @@ class Socket extends socket_io_client_1.Socket {
     emit(ev, ...args) {
         const stream = this.getRTCIOStreamDeep(args);
         if (stream) {
-            /**
-             * const videoYayini = new RTCIOStream(mediaStream);
-             *
-             * rtcio.emit('video-channel1', {streamer: 'mehmet', stream: videoYayini})
-             * rtcio.emit('video-channel2', {streamer: 'mehmet', stream: videoYayini})
-             *
-             */
-            // streamEvents: {
-            // 	'47983749384739(videoyayini)': {
-            // 		'video-channel': {streamer: 'mehmet', stream: 'ahmet' },
-            // 		'video-channel2': {streamer: 'mehmet', stream: 'ahmet' },
-            //  }
-            // }
             this.log('debug', `emit stream event: ${ev}`, { streamId: stream.id });
             if (!this.streamEvents[stream.id]) {
                 this.streamEvents[stream.id] = {};
@@ -364,30 +318,23 @@ class Socket extends socket_io_client_1.Socket {
     getPeer(id) {
         return this.rtcpeers[id];
     }
-    // ─── W3C Perfect Negotiation: Incoming signaling message handler ─────
-    // Reference: https://w3c.github.io/webrtc-pc/#perfect-negotiation-example
+    // https://w3c.github.io/webrtc-pc/#perfect-negotiation-example
     async handleCallServiceMessage(payload) {
         const { source } = payload;
         let isNewPeer = false;
         let peer = this.getPeer(source);
         if (!peer) {
-            // Create bare connection — do NOT replay streams yet.
-            // Stream replay happens AFTER the initial offer/answer exchange
-            // to prevent onnegotiationneeded from racing with setRemoteDescription.
+            // Impolite side: stream replay deferred until after the initial offer/answer
+            // to prevent onnegotiationneeded racing with setRemoteDescription.
+            // No data channel here — the polite peer creates it; adding one here would
+            // cause glare that drops subsequent stream track offers.
             peer = this.createPeerConnection(payload, { polite: false });
-            // NOTE: Do NOT create a data channel here. The impolite side
-            // receives the data channel from the polite peer (who creates it
-            // in initializeConnection). Creating one here would fire
-            // onnegotiationneeded, causing the impolite side to send an offer
-            // that races with the incoming offer, leading to glare where
-            // subsequent offers carrying stream tracks get dropped.
             isNewPeer = true;
             this.log('debug', 'Created impolite peer (deferred stream replay)', { peer: source });
         }
         const { description, candidate, mid, events } = payload.data;
         if (description) {
             this.log('debug', `Received ${description.type}`, { peer: source, signalingState: peer.connection.signalingState });
-            // ── Perfect Negotiation: collision detection ──────────────────
             const readyForOffer = !peer.connectionStatus.makingOffer &&
                 (peer.connection.signalingState === "stable" ||
                     peer.connectionStatus.isSettingRemoteAnswerPending);
@@ -397,11 +344,6 @@ class Socket extends socket_io_client_1.Socket {
                 this.log('debug', 'Ignoring colliding offer (impolite)', { peer: source });
                 return;
             }
-            // ── Perfect Negotiation: single setRemoteDescription path ────
-            // The W3C spec uses ONE setRemoteDescription call for ALL types.
-            // The browser handles rollback implicitly when we call
-            // setRemoteDescription(offer) while in have-local-offer state
-            // (for polite peers). No manual rollback needed.
             peer.connectionStatus.isSettingRemoteAnswerPending =
                 description.type === "answer";
             try {
@@ -428,10 +370,9 @@ class Socket extends socket_io_client_1.Socket {
             finally {
                 peer.connectionStatus.isSettingRemoteAnswerPending = false;
             }
-            // ── Perfect Negotiation: answer with implicit SDP creation ───
             if (description.type === "offer") {
                 await peer.connection.setLocalDescription();
-                this.emit("#rtc-message", {
+                this.emit(events_1.RtcioEvents.MESSAGE, {
                     source: this.id,
                     target: peer.socketId,
                     data: {
@@ -440,9 +381,7 @@ class Socket extends socket_io_client_1.Socket {
                 });
                 this.log('debug', 'Sent answer', { peer: source });
             }
-            // Now that signaling is stable, safe to add local tracks.
-            // Defer to next microtask so the current signaling handler
-            // finishes completely before onnegotiationneeded fires.
+            // Defer so this handler finishes before onnegotiationneeded fires on stream replay.
             if (isNewPeer) {
                 queueMicrotask(() => this.replayStreamsToPeer(peer));
             }
@@ -457,7 +396,7 @@ class Socket extends socket_io_client_1.Socket {
             }
         }
         else if (events) {
-            const rtcioStream = peer.streams[mid]; //id asil idden farkli.!
+            const rtcioStream = peer.streams[mid];
             this.log('debug', 'Received stream events', { mid, events, hasStream: !!rtcioStream, peerStreamKeys: Object.keys(peer.streams) });
             if (!rtcioStream) {
                 this.log('warn', 'Stream not found for events — stream not yet registered via ontrack', { mid, peerStreams: Object.keys(peer.streams) });
@@ -467,6 +406,7 @@ class Socket extends socket_io_client_1.Socket {
                 this.listeners(key).forEach((listener) => {
                     // Deserialize the full args array, then spread — mirrors how socket.io
                     // dispatches events and correctly handles multi-arg emits.
+                    // .call(this) so once wrappers can call this.off() to unsubscribe.
                     // .call(this) so once wrappers can call this.off() to unsubscribe.
                     const args = events[key].map((arg) => this.deserializeStreamEvent(arg, rtcioStream));
                     listener.call(this, ...args);
@@ -484,9 +424,7 @@ class Socket extends socket_io_client_1.Socket {
             }
             const events = this.streamEvents[rtcioStream.id];
             if (!events || Object.keys(events).length === 0) {
-                // No events registered yet — don't send an empty response.
-                // The receiver already has the stream via ontrack; when the sender
-                // calls emit() later, replayStreamsToPeer will push events at that point.
+                // No events yet — sender will push them via replayStreamsToPeer when emit() is called.
                 this.log('debug', 'No events for stream yet, skipping metadata response', { mid });
                 return;
             }
@@ -498,10 +436,9 @@ class Socket extends socket_io_client_1.Socket {
                     events,
                 }),
             };
-            this.emit("#rtc-message", payload);
+            this.emit(events_1.RtcioEvents.MESSAGE, payload);
         }
     }
-    // ─── Replay local streams to a peer after signaling is stable ────
     replayStreamsToPeer(peer) {
         for (const streamKey in this.streamEvents) {
             const events = this.streamEvents[streamKey];
@@ -515,18 +452,12 @@ class Socket extends socket_io_client_1.Socket {
             streamCount: Object.keys(this.streamEvents).length,
         });
     }
-    /**
-     * Initializes the peer connection.
-     * Used for the POLITE path (via #init-rtc-offer).
-     * Polite peers initiate the offer, so replaying streams immediately is safe —
-     * there's no incoming offer to collide with.
-     */
+    /** Polite path: initiates the offer and replays any local streams immediately. */
     initializeConnection(payload, options = { polite: true }) {
         try {
             const peer = this.createPeerConnection(payload, options);
             //  data channel to connect with even without media
             peer.connection.createDataChannel("connectionSetup");
-            //  add transceivers if there are streams 
             if (Object.keys(this.streamEvents).length > 0) {
                 for (const streamKey in this.streamEvents) {
                     const events = this.streamEvents[streamKey];
@@ -582,7 +513,6 @@ class Socket extends socket_io_client_1.Socket {
                 for (const key in data) {
                     data[key] = this.deserializeStreamEvent(data[key], rtcioStream);
                 }
-                //media streamin'id sini looplayacak konuma geliyor
             }
         }
         catch (err) {
@@ -590,9 +520,6 @@ class Socket extends socket_io_client_1.Socket {
         }
         return data;
     }
-    // ─── Centralized peer cleanup ────────────────────────────────────
-    // Closes the connection, removes all references, and notifies
-    // the application.
     cleanupPeer(peerId) {
         const peer = this.rtcpeers[peerId];
         if (!peer)

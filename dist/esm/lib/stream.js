@@ -32,7 +32,6 @@ export class RTCIOStream {
         return this;
     }
     replace(stream) {
-        //  tracks in the stream with new ones
         const oldTracks = [...this.mediaStream.getTracks()];
         oldTracks.forEach(track => this.mediaStream.removeTrack(track));
         stream.getTracks().forEach(track => this.mediaStream.addTrack(track));

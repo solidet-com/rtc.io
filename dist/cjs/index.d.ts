@@ -26,4 +26,5 @@ export { protocol } from "socket.io-parser";
  *
  * @public
  */
+export { RtcioEvents } from "./lib/events";
 export { RTCIOStream, Manager, Socket, lookup as io, lookup as connect, lookup as default, };

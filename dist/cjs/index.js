@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.Socket = exports.Manager = exports.RTCIOStream = exports.protocol = void 0;
+exports.Socket = exports.Manager = exports.RTCIOStream = exports.RtcioEvents = exports.protocol = void 0;
 exports.io = lookup;
 exports.connect = lookup;
 exports.default = lookup;
@@ -57,3 +57,10 @@ Object.assign(lookup, {
  */
 var socket_io_parser_1 = require("socket.io-parser");
 Object.defineProperty(exports, "protocol", { enumerable: true, get: function () { return socket_io_parser_1.protocol; } });
+/**
+ * Expose constructors for standalone build.
+ *
+ * @public
+ */
+var events_1 = require("./lib/events");
+Object.defineProperty(exports, "RtcioEvents", { enumerable: true, get: function () { return events_1.RtcioEvents; } });

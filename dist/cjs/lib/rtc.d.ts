@@ -35,12 +35,7 @@ export declare class Socket extends RootSocket {
     private enqueueSignalingMessage;
     handleCallServiceMessage(payload: MessagePayload): Promise<void>;
     private replayStreamsToPeer;
-    /**
-     * Initializes the peer connection.
-     * Used for the POLITE path (via #init-rtc-offer).
-     * Polite peers initiate the offer, so replaying streams immediately is safe —
-     * there's no incoming offer to collide with.
-     */
+    /** Polite path: initiates the offer and replays any local streams immediately. */
     initializeConnection(payload: MessagePayload, options?: {
         polite: boolean;
     }): RTCPeer;
