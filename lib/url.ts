@@ -79,9 +79,7 @@ export function url(
 	const ipv6 = obj.host.indexOf(":") !== -1;
 	const host = ipv6 ? "[" + obj.host + "]" : obj.host;
 
-	// define unique id
 	obj.id = obj.protocol + "://" + host + ":" + obj.port + path;
-	// define href
 	obj.href =
 		obj.protocol +
 		"://" +

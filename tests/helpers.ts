@@ -1,5 +1,6 @@
 import { createServer } from 'http';
 import { Server } from 'socket.io';
+import { RtcioEvents } from '../lib/events';
 import type { AddressInfo } from 'net';
 
 export interface TestServer {
@@ -9,8 +10,8 @@ export interface TestServer {
 
 /**
  * In-process socket.io server that implements the minimal room protocol:
- * - join-room   → broadcasts #init-rtc-offer to all existing room members
- * - #rtc-message → forwarded to the named target peer
+ * - join-room              → broadcasts RtcioEvents.INIT_OFFER to all existing room members
+ * - RtcioEvents.MESSAGE → forwarded to the named target peer
  */
 export async function createTestServer(): Promise<TestServer> {
 	const http = createServer();
@@ -22,7 +23,7 @@ export async function createTestServer(): Promise<TestServer> {
 			const room = rooms.get(roomId) ?? new Set<string>();
 			// Tell every existing peer to initiate a connection towards the newcomer.
 			room.forEach((peerId) => {
-				io.to(peerId).emit('#init-rtc-offer', {
+				io.to(peerId).emit(RtcioEvents.INIT_OFFER, {
 					source: socket.id,
 					target: peerId,
 					data:   {},
@@ -33,8 +34,8 @@ export async function createTestServer(): Promise<TestServer> {
 			socket.join(roomId);
 		});
 
-		socket.on('#rtc-message', (payload: { target: string }) => {
-			io.to(payload.target).emit('#rtc-message', payload);
+		socket.on(RtcioEvents.MESSAGE, (payload: { target: string }) => {
+			io.to(payload.target).emit(RtcioEvents.MESSAGE, payload);
 		});
 
 		socket.on('disconnect', () => {
