@@ -4,18 +4,24 @@
 * @property {function} [createRTCSample] - Method for parsing an RTCStatsReport
 */
 /**
-* Collects any WebRTC statistics for the given {@link PeerConnection}
-* @param {PeerConnection} peerConnection - Target connection.
+* Collects any WebRTC statistics for the given peer connection.
+* @param {RTCPeerConnection} peerConnection - Target connection.
 * @param {StatsOptions} options - List of custom options.
-* @return {Promise<RTCSample>} Universally-formatted version of RTC stats.
+* @return {Promise<any>} Universally-formatted version of RTC stats.
 */
-export function getRTCStats(peerConnection: PeerConnection, options: StatsOptions): Promise<RTCSample>;
+export function getRTCStats(peerConnection: RTCPeerConnection, options: StatsOptions): Promise<any>;
 /**
-* Generate WebRTC stats report containing relevant information about ICE candidates for the given {@link PeerConnection}
-* @param {PeerConnection} peerConnection - Target connection.
-* @return {Promise<RTCIceCandidateStatsReport>} RTCIceCandidateStatsReport object
+* Generate WebRTC stats report with information about ICE candidates for the given peer connection.
+* @param {RTCPeerConnection} peerConnection - Target connection.
+* @return {Promise<{iceCandidateStats: any[]; selectedIceCandidatePairStats?: {localCandidate: any; remoteCandidate: any}}>} ICE candidate stats report.
 */
-export function getRTCIceCandidateStatsReport(peerConnection: PeerConnection): Promise<RTCIceCandidateStatsReport>;
+export function getRTCIceCandidateStatsReport(peerConnection: RTCPeerConnection): Promise<{
+    iceCandidateStats: any[];
+    selectedIceCandidatePairStats?: {
+        localCandidate: any;
+        remoteCandidate: any;
+    };
+}>;
 /**
  * Used for testing to inject and extract methods.
  */

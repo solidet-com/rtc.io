@@ -17,7 +17,7 @@ export declare class RTCIOChannel {
     constructor(queueBudget?: number);
     _attach(dc: RTCDataChannel): void;
     _isAttached(): boolean;
-    emit(eventName: string, payload?: any): void;
+    emit(eventName: string, ...args: any[]): void;
     send(data: ArrayBuffer | string): boolean;
     on(event: string, handler: Listener): this;
     off(event: string, handler: Listener): this;
@@ -25,7 +25,7 @@ export declare class RTCIOChannel {
     close(): void;
     get readyState(): RTCDataChannelState;
     get bufferedAmount(): number;
-    _dispatchLocal(event: string, data?: any): void;
+    _dispatchLocal(event: string, ...args: any[]): void;
     private _write;
     private _enqueue;
     private _flush;

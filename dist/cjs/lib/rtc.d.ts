@@ -18,6 +18,8 @@ type RTCPeer = {
     ctrlDc: RTCDataChannel | null;
     ctrlQueue: string[];
     channels: Record<string, RTCIOChannel>;
+    channelIds: Map<number, string>;
+    connectFired: boolean;
 };
 type connectionStatus = {
     makingOffer: boolean;
@@ -27,6 +29,7 @@ type connectionStatus = {
     negotiationInProgress: boolean;
 };
 export declare class Socket extends RootSocket {
+    private static readonly MAX_CTRL_QUEUE;
     private rtcpeers;
     private streamEvents;
     private signalingQueues;
@@ -65,7 +68,7 @@ export declare class Socket extends RootSocket {
      * specific peer, and creates named custom DataChannels to that peer.
      */
     peer(peerId: string): {
-        emit: (ev: string, payload?: any) => void;
+        emit: (ev: string, ...args: any[]) => void;
         on: (ev: string, handler: (...args: any[]) => void) => void;
         off: (ev: string, handler: (...args: any[]) => void) => void;
         createChannel: (name: string, options?: ChannelOptions) => RTCIOChannel;
@@ -98,21 +101,28 @@ export declare class Socket extends RootSocket {
     }) => RTCPeer;
     private cleanupPeer;
     /**
-     * Returns the RTCIOChannel for (peerId, name), creating it if needed and
-     * attaching the underlying DC if we are polite for this peer.  Tolerates
-     * any ordering between createChannel(name) and ondatachannel.
+     * Returns the RTCIOChannel for (peerId, name), creating and attaching the
+     * underlying negotiated DataChannel if needed. Both peers compute the same
+     * SCTP stream id from the channel name, so attach is symmetric — there is
+     * no polite/impolite branch and no ondatachannel race.
+     *
+     * For two-way communication the matching peer must also call
+     * createChannel(name) (broadcast or per-peer); otherwise sends are
+     * dropped at the remote SCTP layer.
      */
     private _getOrCreateChannel;
     /**
      * Replays all registered broadcast channel defs onto a newly connected peer.
-     * Mirrors replayStreamsToPeer.  Only the polite side actually creates DCs;
-     * the impolite side waits for ondatachannel to attach them.
+     * Both sides run this symmetrically: each side independently creates the
+     * negotiated DC with the deterministic id from hashChannelName(name), so
+     * no further signaling is needed.
      */
     private _replayChannelsToPeer;
     private _setupCtrlDc;
     private _broadcastCtrl;
     private _sendCtrl;
     private _sendCtrlRaw;
+    private _enqueueCtrl;
     private _flushCtrlQueue;
     private _addPeerListener;
     private _removePeerListener;

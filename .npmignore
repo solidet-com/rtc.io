@@ -1,0 +1,3 @@
+# Build cache files — not useful to consumers, just bloat.
+*.tsbuildinfo
+**/*.tsbuildinfo

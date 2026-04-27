@@ -6,7 +6,7 @@ export declare class RTCIOBroadcastChannel {
     private _closed;
     _addPeer(peerId: string, channel: RTCIOChannel): void;
     _removePeer(peerId: string): void;
-    emit(eventName: string, payload?: any): void;
+    emit(eventName: string, ...args: any[]): void;
     send(data: ArrayBuffer | string): boolean;
     on(event: string, handler: Listener): this;
     off(event: string, handler: Listener): this;

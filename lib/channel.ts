@@ -47,7 +47,9 @@ export class RTCIOChannel {
 			if (typeof data === "string") {
 				try {
 					const { e, d } = JSON.parse(data);
-					this._dispatchLocal(e, d);
+					if (typeof e !== "string") return;
+					const args: any[] = Array.isArray(d) ? d : [];
+					this._dispatchLocal(e, ...args);
 				} catch {
 					this._dispatchLocal(
 						"error",
@@ -74,8 +76,14 @@ export class RTCIOChannel {
 		return this._dc !== null;
 	}
 
-	emit(eventName: string, payload?: any): void {
-		const message = JSON.stringify({ e: eventName, d: payload ?? null });
+	emit(eventName: string, ...args: any[]): void {
+		if (typeof args[args.length - 1] === "function") {
+			console.warn(
+				`[rtc-io] RTCIOChannel.emit('${eventName}'): ack callbacks are not supported — dropping callback`,
+			);
+			args = args.slice(0, -1);
+		}
+		const message = JSON.stringify({ e: eventName, d: args });
 		this._write(message);
 	}
 
@@ -126,13 +134,13 @@ export class RTCIOChannel {
 		return this._dc?.bufferedAmount ?? 0;
 	}
 
-	_dispatchLocal(event: string, data?: any): void {
+	_dispatchLocal(event: string, ...args: any[]): void {
 		const list = this._listeners.get(event);
 		if (!list) return;
 		// snapshot to allow safe off/once during dispatch
 		list.slice().forEach((h) => {
 			try {
-				h(data);
+				h(...args);
 			} catch (e) {
 				console.error(`[rtc-io] RTCIOChannel listener [${event}]`, e);
 			}

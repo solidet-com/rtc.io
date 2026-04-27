@@ -9,3 +9,4 @@ export declare const RtcioEvents: {
 export declare const INTERNAL_EVENT_PREFIX = "#rtcio:";
 export declare const CTRL_CHANNEL_LABEL = "rtcio:ctrl";
 export declare const CUSTOM_CHANNEL_PREFIX = "rtcio:ch:";
+export declare const RESERVED_EVENTS: Set<string>;

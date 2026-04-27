@@ -30,7 +30,10 @@ export class RTCIOChannel {
             if (typeof data === "string") {
                 try {
                     const { e, d } = JSON.parse(data);
-                    this._dispatchLocal(e, d);
+                    if (typeof e !== "string")
+                        return;
+                    const args = Array.isArray(d) ? d : [];
+                    this._dispatchLocal(e, ...args);
                 }
                 catch (_a) {
                     this._dispatchLocal("error", new Error("RTCIOChannel: invalid JSON envelope"));
@@ -52,8 +55,12 @@ export class RTCIOChannel {
     _isAttached() {
         return this._dc !== null;
     }
-    emit(eventName, payload) {
-        const message = JSON.stringify({ e: eventName, d: payload !== null && payload !== void 0 ? payload : null });
+    emit(eventName, ...args) {
+        if (typeof args[args.length - 1] === "function") {
+            console.warn(`[rtc-io] RTCIOChannel.emit('${eventName}'): ack callbacks are not supported — dropping callback`);
+            args = args.slice(0, -1);
+        }
+        const message = JSON.stringify({ e: eventName, d: args });
         this._write(message);
     }
     send(data) {
@@ -100,14 +107,14 @@ export class RTCIOChannel {
         var _a, _b;
         return (_b = (_a = this._dc) === null || _a === void 0 ? void 0 : _a.bufferedAmount) !== null && _b !== void 0 ? _b : 0;
     }
-    _dispatchLocal(event, data) {
+    _dispatchLocal(event, ...args) {
         const list = this._listeners.get(event);
         if (!list)
             return;
         // snapshot to allow safe off/once during dispatch
         list.slice().forEach((h) => {
             try {
-                h(data);
+                h(...args);
             }
             catch (e) {
                 console.error(`[rtc-io] RTCIOChannel listener [${event}]`, e);

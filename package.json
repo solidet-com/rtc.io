@@ -1,45 +1,63 @@
 {
 	"name": "rtc.io",
-	"version": "1.0.1",
-	"description": "WebRTC + socket.io components",
+	"version": "1.1.0",
+	"description": "WebRTC peer-to-peer media, data channels, and broadcast channels — built on socket.io for signaling.",
 	"main": "dist/cjs/index.js",
 	"module": "dist/esm/index.js",
 	"types": "dist/cjs/index.d.ts",
 	"exports": {
 		".": {
+			"types": "./dist/cjs/index.d.ts",
 			"import": "./dist/esm/index.js",
-			"require": "./dist/cjs/index.js",
-			"types": "./dist/cjs/index.d.ts"
+			"require": "./dist/cjs/index.js"
 		}
 	},
 	"files": [
 		"dist",
-		"README.md"
+		"README.md",
+		"LICENSE"
 	],
 	"keywords": [
 		"webrtc",
 		"rtc.io",
-		"signalling server",
-		"websocket",
+		"peer-to-peer",
+		"p2p",
+		"datachannel",
+		"mediastream",
+		"signaling",
+		"socket.io",
 		"realtime",
-		"framework",
-		"tcp",
-		"events",
-		"socket",
-		"io"
+		"streaming",
+		"meeting",
+		"file-transfer"
 	],
+	"license": "MIT",
+	"author": "",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/<your-org>/rtc.io.git"
+	},
+	"bugs": {
+		"url": "https://github.com/<your-org>/rtc.io/issues"
+	},
+	"homepage": "https://github.com/<your-org>/rtc.io#readme",
+	"engines": {
+		"node": ">=18"
+	},
 	"scripts": {
-		"build": "tsc -p tsconfig.cjs.json && tsc -p tsconfig.esm.json"
+		"clean": "rm -rf dist",
+		"build": "npm run clean && tsc -p tsconfig.cjs.json && tsc -p tsconfig.esm.json",
+		"postbuild": "node -e \"require('fs').writeFileSync('dist/esm/package.json', JSON.stringify({type:'module'}, null, 2) + '\\n')\"",
+		"prepack": "npm run build"
 	},
 	"dependencies": {
 		"socket.io-client": "^4.7.4",
 		"uuid": "^11.1.0"
 	},
 	"devDependencies": {
-		"@types/node": "^16.11.7",
+		"@types/node": "^20.11.0",
 		"prettier": "^3.0.3",
 		"socket.io": "^4.7.4",
-		"tsc": "^2.0.4",
 		"typescript": "^5.9.3"
 	}
 }

@@ -12,21 +12,46 @@ var __rest = (this && this.__rest) || function (s, e) {
 import { Socket as RootSocket, } from "socket.io-client";
 import { getRTCStats, getRTCIceCandidateStatsReport } from "./stats/stats.js";
 import { RTCIOStream } from "./stream";
-import { RtcioEvents, INTERNAL_EVENT_PREFIX, CTRL_CHANNEL_LABEL, CUSTOM_CHANNEL_PREFIX, } from "./events";
+import { RtcioEvents, INTERNAL_EVENT_PREFIX, CTRL_CHANNEL_LABEL, CUSTOM_CHANNEL_PREFIX, RESERVED_EVENTS, } from "./events";
 import { RTCIOChannel } from "./channel";
 import { RTCIOBroadcastChannel } from "./broadcast-channel";
+/**
+ * Deterministic 16-bit hash of a channel name. Both peers compute the same id
+ * for the same name, so we can use `negotiated: true` DataChannels without a
+ * polite/impolite handshake. Range: [1, 65534] — id 0 is reserved for the ctrl
+ * channel; 65535 stays free as a sentinel.
+ */
+function hashChannelName(name) {
+    // FNV-1a 32-bit
+    let h = 0x811c9dc5;
+    for (let i = 0; i < name.length; i++) {
+        h ^= name.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+    }
+    return ((h >>> 0) % 65534) + 1;
+}
 export class Socket extends RootSocket {
     constructor(io, nsp, opts) {
         var _a, _b;
         super(io, nsp, opts);
         // Serializes signaling per peer — prevents concurrent messages from interleaving async steps.
+        // `.finally` detaches the chain when this is the tail so the per-peer entry can be GCd
+        // instead of growing without bound for long-lived peers.
         this.enqueueSignalingMessage = (payload) => {
             var _a;
             const peerId = payload.source;
             const prev = (_a = this.signalingQueues[peerId]) !== null && _a !== void 0 ? _a : Promise.resolve();
-            this.signalingQueues[peerId] = prev.then(() => this.handleCallServiceMessage(payload).catch((err) => {
+            const current = prev
+                .then(() => this.handleCallServiceMessage(payload))
+                .catch((err) => {
                 this.log('error', 'Signaling error', { peer: peerId, err });
-            }));
+            })
+                .finally(() => {
+                if (this.signalingQueues[peerId] === current) {
+                    delete this.signalingQueues[peerId];
+                }
+            });
+            this.signalingQueues[peerId] = current;
         };
         this.addTransceiverToPeer = (peer, rtcioStream) => {
             const streamMsId = rtcioStream.mediaStream.id;
@@ -46,30 +71,44 @@ export class Socket extends RootSocket {
             rtcioStream.onTrackChanged((stream) => {
                 var _a;
                 const tracks = stream.getTracks();
+                const trackIds = new Set(tracks.map(t => t.id));
                 const ownTransceivers = (_a = peer.streamTransceivers[streamMsId]) !== null && _a !== void 0 ? _a : [];
-                tracks.forEach(track => {
-                    // Only look at transceivers that belong to THIS stream
-                    const existingTransceiver = ownTransceivers.find(t => t.sender.track && t.sender.track.kind === track.kind);
-                    if (existingTransceiver) {
-                        existingTransceiver.sender.replaceTrack(track);
-                    }
-                    else {
-                        const transceiver = peer.connection.addTransceiver(track, {
-                            direction: "sendonly",
-                            streams: [rtcioStream.mediaStream],
-                        });
-                        peer.streamTransceivers[streamMsId].push(transceiver);
+                // Detach senders whose tracks were removed from the stream — without this
+                // the old track would keep being sent forever even after removeTrack().
+                ownTransceivers.forEach(t => {
+                    const senderTrack = t.sender.track;
+                    if (senderTrack && !trackIds.has(senderTrack.id)) {
+                        t.sender.replaceTrack(null);
+                        t.direction = 'inactive';
                     }
                 });
-                // Browser fires onnegotiationneeded automatically after addTransceiver
+                tracks.forEach(track => {
+                    // Already wired to this exact track — nothing to do.
+                    if (ownTransceivers.some(t => { var _a; return ((_a = t.sender.track) === null || _a === void 0 ? void 0 : _a.id) === track.id; }))
+                        return;
+                    // Reuse a now-empty same-kind transceiver (we just cleared one above,
+                    // or a previously-detached one is sitting idle).
+                    const reusable = ownTransceivers.find(t => { var _a; return t.sender.track === null && ((_a = t.receiver.track) === null || _a === void 0 ? void 0 : _a.kind) === track.kind; });
+                    if (reusable) {
+                        reusable.sender.replaceTrack(track);
+                        reusable.direction = 'sendonly';
+                        if (reusable.sender.setStreams) {
+                            reusable.sender.setStreams(rtcioStream.mediaStream);
+                        }
+                        return;
+                    }
+                    const transceiver = peer.connection.addTransceiver(track, {
+                        direction: "sendonly",
+                        streams: [rtcioStream.mediaStream],
+                    });
+                    peer.streamTransceivers[streamMsId].push(transceiver);
+                });
+                // Browser fires onnegotiationneeded automatically after addTransceiver/replaceTrack/direction.
             });
             const tracks = rtcioStream.mediaStream.getTracks();
             if (tracks.length === 0) {
-                // Placeholder transceiver so the peer knows we have a stream slot
-                const transceiver = peer.connection.addTransceiver('audio', {
-                    direction: "sendonly"
-                });
-                peer.streamTransceivers[streamMsId].push(transceiver);
+                // No tracks yet — nothing to negotiate. onTrackChanged will fire when
+                // the user adds tracks later and wire up transceivers then.
                 return;
             }
             tracks.forEach((track) => {
@@ -126,29 +165,19 @@ export class Socket extends RootSocket {
                 ctrlDc: null,
                 ctrlQueue: [],
                 channels: {},
+                channelIds: new Map(),
+                connectFired: false,
             };
             const peer = this.rtcpeers[source];
             this.log('debug', `Created peer connection`, { peer: source, polite: options.polite });
-            // Receives DataChannels created by the polite side (ctrl + custom).
+            // All rtc.io channels are negotiated:true — we own the SCTP stream IDs, so
+            // neither side should ever receive a DC via ondatachannel. Anything that
+            // shows up here came from a non-rtc.io peer or a future feature; close it.
             peer.connection.ondatachannel = ({ channel: dc }) => {
-                var _a;
-                if (dc.label === CTRL_CHANNEL_LABEL) {
-                    this._setupCtrlDc(dc, peer);
-                    return;
-                }
-                if (!dc.label.startsWith(CUSTOM_CHANNEL_PREFIX))
-                    return;
-                const name = dc.label.slice(CUSTOM_CHANNEL_PREFIX.length);
-                let channel = peer.channels[name];
-                if (!channel) {
-                    channel = new RTCIOChannel();
-                    peer.channels[name] = channel;
-                }
-                if (!channel._isAttached())
-                    channel._attach(dc);
-                // If a broadcast channel with this name was already registered on this side,
-                // wire the peer in.  Otherwise it'll get wired when the user calls createChannel.
-                (_a = this._broadcastChannels.get(name)) === null || _a === void 0 ? void 0 : _a._addPeer(source, channel);
+                this.log('warn', 'Unexpected non-negotiated DataChannel — closing', {
+                    peer: source, label: dc.label,
+                });
+                dc.close();
             };
             // Uses stream.onaddtrack for late-arriving tracks; creates a synthetic stream if streams[] is empty.
             peer.connection.ontrack = ({ transceiver, track, streams }) => {
@@ -285,6 +314,16 @@ export class Socket extends RootSocket {
                     }
                 }
             };
+            // Built-in ctrl channel: negotiated:true so both polite and impolite sides
+            // create it independently with the same id (0) — no DC-OPEN handshake, no
+            // ondatachannel race, symmetric attach. Reserves SCTP stream id 0 for ctrl;
+            // custom channels get ids in [1, 65534] from hashChannelName().
+            const ctrlDc = peer.connection.createDataChannel(CTRL_CHANNEL_LABEL, {
+                negotiated: true,
+                id: 0,
+                ordered: true,
+            });
+            this._setupCtrlDc(ctrlDc, peer);
             return peer;
         };
         this.broadcastPeers = (cb, ...args) => {
@@ -336,8 +375,15 @@ export class Socket extends RootSocket {
             this._rawEmit(ev, ...args);
         }
         else {
-            // User event — broadcast over the ctrl DataChannel to all peers
-            this._broadcastCtrl(ev, args[0]);
+            // User event — broadcast over the ctrl DataChannel to all peers.
+            // Strip a trailing ack callback (socket.io idiom) — DataChannels
+            // have no ack channel, so silently sending it would mislead users.
+            let outArgs = args;
+            if (typeof args[args.length - 1] === 'function') {
+                this.log('warn', `emit('${ev}'): ack callbacks are not supported over peer transport — dropping callback`);
+                outArgs = args.slice(0, -1);
+            }
+            this._broadcastCtrl(ev, outArgs);
         }
         return this;
     }
@@ -380,7 +426,14 @@ export class Socket extends RootSocket {
      */
     peer(peerId) {
         return {
-            emit: (ev, payload) => this._sendCtrl(peerId, ev, payload),
+            emit: (ev, ...args) => {
+                let outArgs = args;
+                if (typeof args[args.length - 1] === 'function') {
+                    this.log('warn', `peer('${peerId}').emit('${ev}'): ack callbacks not supported — dropping callback`);
+                    outArgs = args.slice(0, -1);
+                }
+                this._sendCtrl(peerId, ev, outArgs);
+            },
             on: (ev, handler) => this._addPeerListener(peerId, ev, handler),
             off: (ev, handler) => this._removePeerListener(peerId, ev, handler),
             createChannel: (name, options = {}) => this._getOrCreateChannel(peerId, name, options),
@@ -438,9 +491,10 @@ export class Socket extends RootSocket {
         let peer = this.getPeer(source);
         if (!peer) {
             // Impolite side: stream replay deferred until after the initial offer/answer
-            // to prevent onnegotiationneeded racing with setRemoteDescription.
-            // No data channel here — the polite peer creates it; adding one here would
-            // cause glare that drops subsequent stream track offers.
+            // to prevent onnegotiationneeded racing with setRemoteDescription. The ctrl
+            // DC is created inside createPeerConnection as negotiated:true id:0, which
+            // means both sides describe the same SCTP transport in their initial SDP —
+            // no DC-OPEN handshake, no glare from the ctrl channel itself.
             peer = this.createPeerConnection(payload, { polite: false });
             isNewPeer = true;
             this.log('debug', 'Created impolite peer (deferred stream replay)', { peer: source });
@@ -570,10 +624,8 @@ export class Socket extends RootSocket {
     initializeConnection(payload, options = { polite: true }) {
         try {
             const peer = this.createPeerConnection(payload, options);
-            // Built-in ctrl channel: carries user emit/on traffic + keeps the
-            // connection alive even when no media is being sent.
-            const ctrlDc = peer.connection.createDataChannel(CTRL_CHANNEL_LABEL, { ordered: true });
-            this._setupCtrlDc(ctrlDc, peer);
+            // Ctrl channel is now created inside createPeerConnection (negotiated:true),
+            // so both polite and impolite paths get it without an asymmetric handshake.
             this._replayChannelsToPeer(peer);
             if (Object.keys(this.streamEvents).length > 0) {
                 for (const streamKey in this.streamEvents) {
@@ -658,15 +710,25 @@ export class Socket extends RootSocket {
         peer.connection.close();
         delete this.rtcpeers[peerId];
         delete this.signalingQueues[peerId];
-        this.listeners("peer-disconnect").forEach((listener) => {
-            listener({ id: peerId });
-        });
+        // Only notify if the peer ever fully connected — otherwise apps using
+        // the acquire-on-connect / release-on-disconnect pattern get a release
+        // without a matching acquire (e.g. ICE failure before ctrl DC opens).
+        if (peer.connectFired) {
+            this.listeners("peer-disconnect").forEach((listener) => {
+                listener({ id: peerId });
+            });
+        }
     }
     // ─── Channel matching ───────────────────────────────────────────────────
     /**
-     * Returns the RTCIOChannel for (peerId, name), creating it if needed and
-     * attaching the underlying DC if we are polite for this peer.  Tolerates
-     * any ordering between createChannel(name) and ondatachannel.
+     * Returns the RTCIOChannel for (peerId, name), creating and attaching the
+     * underlying negotiated DataChannel if needed. Both peers compute the same
+     * SCTP stream id from the channel name, so attach is symmetric — there is
+     * no polite/impolite branch and no ondatachannel race.
+     *
+     * For two-way communication the matching peer must also call
+     * createChannel(name) (broadcast or per-peer); otherwise sends are
+     * dropped at the remote SCTP layer.
      */
     _getOrCreateChannel(peerId, name, options) {
         const peer = this.rtcpeers[peerId];
@@ -678,17 +740,25 @@ export class Socket extends RootSocket {
             channel = new RTCIOChannel(options.queueBudget);
             peer.channels[name] = channel;
         }
-        if (!channel._isAttached() && peer.polite) {
+        if (!channel._isAttached()) {
+            const id = hashChannelName(name);
+            const taken = peer.channelIds.get(id);
+            if (taken && taken !== name) {
+                throw new Error(`[rtc-io] Channel '${name}' hash-collides with existing channel '${taken}' on peer ${peerId} ` +
+                    `(both names hash to SCTP id ${id}). Pick a different channel name.`);
+            }
+            peer.channelIds.set(id, name);
             const { queueBudget: _qb } = options, dcInit = __rest(options, ["queueBudget"]);
-            const dc = peer.connection.createDataChannel(`${CUSTOM_CHANNEL_PREFIX}${name}`, dcInit);
+            const dc = peer.connection.createDataChannel(`${CUSTOM_CHANNEL_PREFIX}${name}`, Object.assign(Object.assign({}, dcInit), { negotiated: true, id }));
             channel._attach(dc);
         }
         return channel;
     }
     /**
      * Replays all registered broadcast channel defs onto a newly connected peer.
-     * Mirrors replayStreamsToPeer.  Only the polite side actually creates DCs;
-     * the impolite side waits for ondatachannel to attach them.
+     * Both sides run this symmetrically: each side independently creates the
+     * negotiated DC with the deterministic id from hashChannelName(name), so
+     * no further signaling is needed.
      */
     _replayChannelsToPeer(peer) {
         var _a;
@@ -721,9 +791,12 @@ export class Socket extends RootSocket {
                     this.log("error", "peer-connect listener", err);
                 }
             });
+            peer.connectFired = true;
         };
         dc.onclose = () => {
             this.log('debug', 'Ctrl channel closed', { peer: peer.socketId });
+            // Drop any pending envelopes — they have nowhere to go.
+            peer.ctrlQueue.length = 0;
         };
         dc.onerror = (e) => {
             this.log('warn', 'Ctrl channel error', { peer: peer.socketId, e });
@@ -743,11 +816,18 @@ export class Socket extends RootSocket {
             const name = envelope.e;
             if (typeof name !== "string")
                 return;
-            const payload = envelope.d;
+            // Security: a peer must not be able to spoof internal signaling
+            // (#rtcio:*) or library lifecycle events (peer-connect, etc.) — those
+            // are emitted only by the local Socket.
+            if (name.startsWith(INTERNAL_EVENT_PREFIX) || RESERVED_EVENTS.has(name)) {
+                this.log('warn', 'Ctrl: dropped reserved event from peer', { peer: peer.socketId, name });
+                return;
+            }
+            const args = Array.isArray(envelope.d) ? envelope.d : [];
             // Global listeners (registered via rtc.on(name, handler))
             this.listeners(name).forEach((h) => {
                 try {
-                    h(payload);
+                    h(...args);
                 }
                 catch (err) {
                     this.log('error', `Listener error [${name}]`, err);
@@ -756,7 +836,7 @@ export class Socket extends RootSocket {
             // Per-peer listeners (registered via rtc.peer(id).on(name, handler))
             (_b = (_a = this._peerListeners.get(peer.socketId)) === null || _a === void 0 ? void 0 : _a.get(name)) === null || _b === void 0 ? void 0 : _b.slice().forEach((h) => {
                 try {
-                    h(payload);
+                    h(...args);
                 }
                 catch (err) {
                     this.log('error', `Peer listener error [${name}]`, err);
@@ -764,30 +844,44 @@ export class Socket extends RootSocket {
             });
         };
     }
-    _broadcastCtrl(name, payload) {
-        const envelope = JSON.stringify({ e: name, d: payload !== null && payload !== void 0 ? payload : null });
+    _broadcastCtrl(name, args) {
+        const envelope = JSON.stringify({ e: name, d: args });
         Object.values(this.rtcpeers).forEach((peer) => this._sendCtrlRaw(peer, envelope));
     }
-    _sendCtrl(peerId, name, payload) {
+    _sendCtrl(peerId, name, args) {
         const peer = this.rtcpeers[peerId];
         if (!peer)
             return;
-        this._sendCtrlRaw(peer, JSON.stringify({ e: name, d: payload !== null && payload !== void 0 ? payload : null }));
+        this._sendCtrlRaw(peer, JSON.stringify({ e: name, d: args }));
     }
     _sendCtrlRaw(peer, envelope) {
-        var _a;
-        if (((_a = peer.ctrlDc) === null || _a === void 0 ? void 0 : _a.readyState) === "open") {
+        const dc = peer.ctrlDc;
+        const state = dc === null || dc === void 0 ? void 0 : dc.readyState;
+        if (state === "open") {
             try {
-                peer.ctrlDc.send(envelope);
+                dc.send(envelope);
+                return;
             }
             catch (e) {
                 this.log('warn', 'Ctrl send failed, queueing', { peer: peer.socketId, e });
-                peer.ctrlQueue.push(envelope);
+                this._enqueueCtrl(peer, envelope);
+                return;
             }
         }
-        else {
-            peer.ctrlQueue.push(envelope);
+        // Channel is gone — buffering would be a leak with no recipient.
+        if (state === "closing" || state === "closed") {
+            this.log('warn', 'Ctrl DC closed, dropping message', { peer: peer.socketId });
+            return;
         }
+        // dc is null (not yet attached) or "connecting" — buffer for the open handler.
+        this._enqueueCtrl(peer, envelope);
+    }
+    _enqueueCtrl(peer, envelope) {
+        if (peer.ctrlQueue.length >= Socket.MAX_CTRL_QUEUE) {
+            peer.ctrlQueue.shift();
+            this.log('warn', 'Ctrl queue full, dropped oldest', { peer: peer.socketId });
+        }
+        peer.ctrlQueue.push(envelope);
     }
     _flushCtrlQueue(peer) {
         var _a;
@@ -864,3 +958,6 @@ export class Socket extends RootSocket {
         return await getRTCIceCandidateStatsReport(peerConnection);
     }
 }
+// Bounded ctrl-channel buffer per peer. Drops oldest when full so a closed
+// or slow peer can't pin unbounded memory in long-lived sessions.
+Socket.MAX_CTRL_QUEUE = 1024;

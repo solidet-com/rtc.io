@@ -28,8 +28,8 @@ class RTCIOBroadcastChannel {
             this._dispatch("close");
         }
     }
-    emit(eventName, payload) {
-        this._peers.forEach((ch) => ch.emit(eventName, payload));
+    emit(eventName, ...args) {
+        this._peers.forEach((ch) => ch.emit(eventName, ...args));
     }
     send(data) {
         let allOk = true;

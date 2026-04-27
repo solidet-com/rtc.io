@@ -30,8 +30,8 @@ export class RTCIOBroadcastChannel {
 		}
 	}
 
-	emit(eventName: string, payload?: any): void {
-		this._peers.forEach((ch) => ch.emit(eventName, payload));
+	emit(eventName: string, ...args: any[]): void {
+		this._peers.forEach((ch) => ch.emit(eventName, ...args));
 	}
 
 	send(data: ArrayBuffer | string): boolean {
