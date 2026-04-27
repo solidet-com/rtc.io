@@ -22,10 +22,18 @@ export interface SocketOptions extends Partial<RootSocketOptions> {
 }
 
 /**
- * Deterministic 16-bit hash of a channel name. Both peers compute the same id
- * for the same name, so we can use `negotiated: true` DataChannels without a
- * polite/impolite handshake. Range: [1, 65534] — id 0 is reserved for the ctrl
- * channel; 65535 stays free as a sentinel.
+ * Deterministic hash of a channel name. Both peers compute the same id for the
+ * same name, so we can use `negotiated: true` DataChannels without a polite/
+ * impolite handshake.
+ *
+ * Range is [1, 1023] — id 0 is reserved for the ctrl channel. The upper bound
+ * is set by Chromium's SCTP transport, which caps stream ids at 1023 (its
+ * `kMaxSctpStreams = 1024`); creating a DataChannel with `id` outside this
+ * range fails with `OperationError: RTCDataChannel creation failed`. Firefox
+ * is more permissive but we pick the lowest common denominator.
+ *
+ * Hash collisions are detected per-peer and surface as a clear error to the
+ * caller (see `_getOrCreateChannel`).
  */
 function hashChannelName(name: string): number {
 	// FNV-1a 32-bit
@@ -34,7 +42,7 @@ function hashChannelName(name: string): number {
 		h ^= name.charCodeAt(i);
 		h = Math.imul(h, 0x01000193);
 	}
-	return ((h >>> 0) % 65534) + 1;
+	return ((h >>> 0) % 1023) + 1;
 }
 
 type RTCPeer = {
@@ -423,10 +431,9 @@ export class Socket extends RootSocket {
 		try {
 			const peer = this.createPeerConnection(payload, options);
 
-			// Ctrl channel is now created inside createPeerConnection (negotiated:true),
-			// so both polite and impolite paths get it without an asymmetric handshake.
-			this._replayChannelsToPeer(peer);
-
+			// Replay streams before channels: media is the primary use case, and
+			// a per-channel failure (e.g. a future browser tightening SCTP id
+			// rules) must not silently strand the peer without media.
 			if (Object.keys(this.streamEvents).length > 0) {
 				for (const streamKey in this.streamEvents) {
 					const events = this.streamEvents[streamKey];
@@ -437,6 +444,10 @@ export class Socket extends RootSocket {
 					}
 				}
 			}
+
+			// Ctrl channel is now created inside createPeerConnection (negotiated:true),
+			// so both polite and impolite paths get it without an asymmetric handshake.
+			this._replayChannelsToPeer(peer);
 
 			this.log('debug', `Initialized ${options.polite ? 'polite' : 'impolite'} peer`, { peer: payload.source });
 		} catch (error) {
@@ -803,7 +814,9 @@ export class Socket extends RootSocket {
 		// Built-in ctrl channel: negotiated:true so both polite and impolite sides
 		// create it independently with the same id (0) — no DC-OPEN handshake, no
 		// ondatachannel race, symmetric attach. Reserves SCTP stream id 0 for ctrl;
-		// custom channels get ids in [1, 65534] from hashChannelName().
+		// custom channels get ids in [1, 1023] from hashChannelName() (Chromium
+		// caps SCTP streams at 1024, so the range matches the lowest common
+		// browser ceiling).
 		const ctrlDc = peer.connection.createDataChannel(CTRL_CHANNEL_LABEL, {
 			negotiated: true,
 			id: 0,
@@ -912,8 +925,19 @@ export class Socket extends RootSocket {
 	 */
 	private _replayChannelsToPeer(peer: RTCPeer): void {
 		for (const { name, options } of this._channelDefs) {
-			const channel = this._getOrCreateChannel(peer.socketId, name, options);
-			this._broadcastChannels.get(name)?._addPeer(peer.socketId, channel);
+			// Isolate per channel — a single bad channel (hash collision, browser
+			// SCTP-id rejection, etc.) must not abort replay of the rest, and
+			// must not bubble up to the caller. The impolite path schedules this
+			// in a queueMicrotask, so an unhandled throw there becomes an
+			// uncaught exception with no way for the app to recover.
+			try {
+				const channel = this._getOrCreateChannel(peer.socketId, name, options);
+				this._broadcastChannels.get(name)?._addPeer(peer.socketId, channel);
+			} catch (err) {
+				this.log('error', `Failed to replay channel '${name}' to peer`, {
+					peer: peer.socketId, err,
+				});
+			}
 		}
 		if (this._channelDefs.length > 0) {
 			this.log('debug', 'Replayed channels to peer', {
