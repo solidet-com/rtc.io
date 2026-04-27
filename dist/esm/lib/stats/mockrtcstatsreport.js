@@ -1,4 +1,3 @@
-"use strict";
 /**
  * This file was imported from another project. If making changes to this file, please don't
  * make them here. Make them on the linked repo below, then copy back:
@@ -400,5 +399,5 @@ function isPresent(report, statName) {
     var stat = report.stat(statName);
     return typeof stat !== 'undefined' && stat !== '';
 }
-module.exports = MockRTCStatsReport;
+export default MockRTCStatsReport;
 //# sourceMappingURL=mockrtcstatsreport.js.map

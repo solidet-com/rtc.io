@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.Socket = exports.Manager = exports.RTCIOStream = exports.RtcioEvents = exports.protocol = void 0;
+exports.Socket = exports.Manager = exports.RTCIOBroadcastChannel = exports.RTCIOChannel = exports.RTCIOStream = exports.RtcioEvents = exports.protocol = void 0;
 exports.io = lookup;
 exports.connect = lookup;
 exports.default = lookup;
@@ -11,6 +11,10 @@ const manager_1 = require("./lib/manager");
 Object.defineProperty(exports, "Manager", { enumerable: true, get: function () { return manager_1.Manager; } });
 const stream_1 = require("./lib/stream");
 Object.defineProperty(exports, "RTCIOStream", { enumerable: true, get: function () { return stream_1.RTCIOStream; } });
+const channel_1 = require("./lib/channel");
+Object.defineProperty(exports, "RTCIOChannel", { enumerable: true, get: function () { return channel_1.RTCIOChannel; } });
+const broadcast_channel_1 = require("./lib/broadcast-channel");
+Object.defineProperty(exports, "RTCIOBroadcastChannel", { enumerable: true, get: function () { return broadcast_channel_1.RTCIOBroadcastChannel; } });
 /**
  * Managers cache.
  */

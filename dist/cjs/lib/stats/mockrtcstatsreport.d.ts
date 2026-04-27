@@ -1,4 +1,4 @@
-export = MockRTCStatsReport;
+export default MockRTCStatsReport;
 /**
  * Create a MockRTCStatsReport wrapper around a Map of RTCStats objects. If RTCStatsReport is available
  *   natively, it will be inherited so that instanceof checks pass.

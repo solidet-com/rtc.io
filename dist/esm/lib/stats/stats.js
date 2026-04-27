@@ -1,4 +1,3 @@
-"use strict";
 var __spreadArrays = (this && this.__spreadArrays) || function () {
     for (var s = 0, i = 0, il = arguments.length; i < il; i++)
         s += arguments[i].length;
@@ -8,7 +7,7 @@ var __spreadArrays = (this && this.__spreadArrays) || function () {
     return r;
 };
 /* eslint-disable no-fallthrough */
-var MockRTCStatsReport = require('./mockrtcstatsreport');
+import MockRTCStatsReport from './mockrtcstatsreport.js';
 var ERROR_PEER_CONNECTION_NULL = 'PeerConnection is null';
 var ERROR_WEB_RTC_UNSUPPORTED = 'WebRTC statistics are unsupported';
 /**
@@ -43,7 +42,7 @@ function getRTCStatsReport(peerConnection) {
 * @param {StatsOptions} options - List of custom options.
 * @return {Promise<RTCSample>} Universally-formatted version of RTC stats.
 */
-function getRTCStats(peerConnection, options) {
+export function getRTCStats(peerConnection, options) {
     options = Object.assign({
         createRTCSample: createRTCSample
     }, options);
@@ -54,7 +53,7 @@ function getRTCStats(peerConnection, options) {
 * @param {PeerConnection} peerConnection - Target connection.
 * @return {Promise<RTCIceCandidateStatsReport>} RTCIceCandidateStatsReport object
 */
-function getRTCIceCandidateStatsReport(peerConnection) {
+export function getRTCIceCandidateStatsReport(peerConnection) {
     return getRTCStatsReport(peerConnection).then(function (report) {
         // Find the relevant information needed to determine selected candidates later
         var _a = Array.from(report.values()).reduce(function (rval, stat) {
@@ -193,8 +192,4 @@ function createRTCSample(statsReport) {
     });
     return sample;
 }
-module.exports = {
-    getRTCStats: getRTCStats,
-    getRTCIceCandidateStatsReport: getRTCIceCandidateStatsReport,
-};
 //# sourceMappingURL=stats.js.map

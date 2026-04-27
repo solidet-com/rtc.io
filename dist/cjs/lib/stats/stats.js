@@ -1,4 +1,10 @@
 "use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.getRTCStats = getRTCStats;
+exports.getRTCIceCandidateStatsReport = getRTCIceCandidateStatsReport;
 var __spreadArrays = (this && this.__spreadArrays) || function () {
     for (var s = 0, i = 0, il = arguments.length; i < il; i++)
         s += arguments[i].length;
@@ -8,7 +14,7 @@ var __spreadArrays = (this && this.__spreadArrays) || function () {
     return r;
 };
 /* eslint-disable no-fallthrough */
-var MockRTCStatsReport = require('./mockrtcstatsreport');
+const mockrtcstatsreport_js_1 = __importDefault(require("./mockrtcstatsreport.js"));
 var ERROR_PEER_CONNECTION_NULL = 'PeerConnection is null';
 var ERROR_WEB_RTC_UNSUPPORTED = 'WebRTC statistics are unsupported';
 /**
@@ -28,7 +34,7 @@ function getRTCStatsReport(peerConnection) {
         promise = peerConnection.getStats();
     }
     catch (e) {
-        promise = new Promise(function (resolve) { return peerConnection.getStats(resolve); }).then(MockRTCStatsReport.fromRTCStatsResponse);
+        promise = new Promise(function (resolve) { return peerConnection.getStats(resolve); }).then(mockrtcstatsreport_js_1.default.fromRTCStatsResponse);
     }
     return promise;
 }
@@ -193,8 +199,4 @@ function createRTCSample(statsReport) {
     });
     return sample;
 }
-module.exports = {
-    getRTCStats: getRTCStats,
-    getRTCIceCandidateStatsReport: getRTCIceCandidateStatsReport,
-};
 //# sourceMappingURL=stats.js.map
