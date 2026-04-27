@@ -1,6 +1,6 @@
 {
 	"name": "rtc.io",
-	"version": "1.1.1",
+	"version": "1.1.2",
 	"description": "WebRTC peer-to-peer media, data channels, and broadcast channels — built on socket.io for signaling.",
 	"main": "dist/cjs/index.js",
 	"module": "dist/esm/index.js",

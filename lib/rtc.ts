@@ -527,47 +527,59 @@ export class Socket extends RootSocket {
 			peer.streamTransceivers[streamMsId] = [];
 		}
 		
-		// Listen for track changes on this stream (e.g. user toggles camera)
+		// Listen for track changes on this stream (e.g. user swaps mic/cam mid-call).
+		// The same-kind swap path uses RTCRtpSender.replaceTrack and does NOT change
+		// transceiver direction, which is the WebRTC primitive for hot-swapping a
+		// track with no SDP renegotiation. Toggling direction (sendonly→inactive→
+		// sendonly) would also work but would round-trip an unnecessary offer/answer
+		// and briefly mute the receiver.
 		rtcioStream.onTrackChanged((stream) => {
 			const tracks = stream.getTracks();
-			const trackIds = new Set(tracks.map(t => t.id));
+			const trackById = new Map(tracks.map(t => [t.id, t]));
 			const ownTransceivers = peer.streamTransceivers[streamMsId] ?? [];
+			const claimed = new Set<string>();
 
-			// Detach senders whose tracks were removed from the stream — without this
-			// the old track would keep being sent forever even after removeTrack().
+			// Pass 1: keep already-wired transceivers as-is.
 			ownTransceivers.forEach(t => {
 				const senderTrack = t.sender.track;
-				if (senderTrack && !trackIds.has(senderTrack.id)) {
+				if (senderTrack && trackById.has(senderTrack.id)) {
+					claimed.add(senderTrack.id);
+				}
+			});
+
+			// Pass 2: rewire transceivers whose sender track was removed.
+			//   - If a same-kind replacement exists in the stream, hot-swap via
+			//     replaceTrack (no renegotiation).
+			//   - Otherwise mark the transceiver inactive (renegotiates) so the
+			//     remote stops expecting media on this m-line.
+			ownTransceivers.forEach(t => {
+				const senderTrack = t.sender.track;
+				if (senderTrack && trackById.has(senderTrack.id)) return;
+
+				const kind = senderTrack?.kind ?? t.receiver.track?.kind;
+				const replacement = tracks.find(tr => tr.kind === kind && !claimed.has(tr.id));
+
+				if (replacement) {
+					t.sender.replaceTrack(replacement);
+					if (t.direction !== 'sendonly') t.direction = 'sendonly';
+					if (t.sender.setStreams) t.sender.setStreams(rtcioStream.mediaStream);
+					claimed.add(replacement.id);
+				} else if (senderTrack) {
 					t.sender.replaceTrack(null);
 					t.direction = 'inactive';
 				}
 			});
 
+			// Pass 3: brand-new tracks of a kind we don't have a transceiver for.
 			tracks.forEach(track => {
-				// Already wired to this exact track — nothing to do.
-				if (ownTransceivers.some(t => t.sender.track?.id === track.id)) return;
-
-				// Reuse a now-empty same-kind transceiver (we just cleared one above,
-				// or a previously-detached one is sitting idle).
-				const reusable = ownTransceivers.find(
-					t => t.sender.track === null && t.receiver.track?.kind === track.kind
-				);
-				if (reusable) {
-					reusable.sender.replaceTrack(track);
-					reusable.direction = 'sendonly';
-					if (reusable.sender.setStreams) {
-						reusable.sender.setStreams(rtcioStream.mediaStream);
-					}
-					return;
-				}
-
+				if (claimed.has(track.id)) return;
 				const transceiver = peer.connection.addTransceiver(track, {
-					direction: "sendonly",
+					direction: 'sendonly',
 					streams: [rtcioStream.mediaStream],
 				});
 				peer.streamTransceivers[streamMsId].push(transceiver);
+				claimed.add(track.id);
 			});
-			// Browser fires onnegotiationneeded automatically after addTransceiver/replaceTrack/direction.
 		});
 
 		const tracks = rtcioStream.mediaStream.getTracks();
