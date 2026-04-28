@@ -5,6 +5,7 @@ export declare const RtcioEvents: {
     readonly MESSAGE: "#rtcio:message";
     readonly STREAM_META: "#rtcio:stream-meta";
     readonly INIT_OFFER: "#rtcio:init-offer";
+    readonly PEER_LEFT: "#rtcio:peer-left";
 };
 export declare const INTERNAL_EVENT_PREFIX = "#rtcio:";
 export declare const CTRL_CHANNEL_LABEL = "rtcio:ctrl";

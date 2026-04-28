@@ -20,6 +20,8 @@ type RTCPeer = {
     channels: Record<string, RTCIOChannel>;
     channelIds: Map<number, string>;
     connectFired: boolean;
+    unhealthyTimer: ReturnType<typeof setTimeout> | null;
+    peerLeftHintAt: number;
 };
 type connectionStatus = {
     makingOffer: boolean;
@@ -31,6 +33,9 @@ type connectionStatus = {
 export declare class Socket extends RootSocket {
     private static readonly MAX_CTRL_QUEUE;
     private static readonly MAX_CTRL_ENVELOPE_BYTES;
+    private static readonly UNHEALTHY_GRACE_MS;
+    private static readonly UNHEALTHY_GRACE_WITH_HINT_MS;
+    private static readonly PEER_LEFT_HINT_VALIDITY_MS;
     private rtcpeers;
     private streamEvents;
     private signalingQueues;
@@ -100,6 +105,35 @@ export declare class Socket extends RootSocket {
     createPeerConnection: (payload: MessagePayload, options: {
         polite: boolean;
     }) => RTCPeer;
+    /**
+     * Armed when a peer's connectionState becomes 'disconnected' or 'failed'.
+     * If the peer hasn't returned to 'connected' by the time the timer fires,
+     * the connection is force-closed and `peer-disconnect` is emitted via
+     * `cleanupPeer`. The grace window shortens when a recent server-side
+     * peer-left hint corroborates that the peer is really gone.
+     *
+     * Re-arming clears any prior timer, so back-to-back state flips
+     * (disconnected → failed) reset the budget rather than racing two timers.
+     */
+    private _armUnhealthyTimer;
+    private _clearUnhealthyTimer;
+    /**
+     * Server-side peer-left hint handler. The signaling socket can drop
+     * independently of the WebRTC connection (server crash or restart, mobile
+     * data → wifi switch, signaling-only firewall change), so this is treated
+     * as advisory rather than authoritative:
+     *
+     *   - If the WebRTC layer already reports the connection as unhealthy
+     *     ('disconnected' or 'failed'), both signals agree and we clean up
+     *     immediately.
+     *   - Otherwise we record the hint timestamp. If the connection later
+     *     goes unhealthy within the validity window, the watchdog uses the
+     *     shortened grace period to clean up faster than ICE consent alone
+     *     would. If the connection stays healthy, the hint is silently
+     *     discarded — so a flaky signaling channel cannot tear down a
+     *     working P2P call.
+     */
+    private _handlePeerLeftHint;
     private cleanupPeer;
     /**
      * Returns the RTCIOChannel for (peerId, name), creating and attaching the

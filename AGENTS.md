@@ -255,9 +255,20 @@ io(url, opts)
   → "peer-connect" fires
   → app emits / on / createChannel work
   → user emits stream → addTransceiver → ontrack on remote → "ev" fires with RTCIOStream
-  → ICE failure → connection.restartIce() automatic
-  → connection.close() → "peer-disconnect" → cleanupPeer
+  → ICE failure → connection.restartIce() automatic, watchdog armed (12 s)
+  → no recovery → watchdog forces close → "peer-disconnect" → cleanupPeer
 ```
+
+## Disconnect detection
+
+Peer departure is detected by a per-peer **liveness watchdog** in the library — not by socket signals alone. When `connectionState` becomes `disconnected` or `failed`, the watchdog arms for a bounded grace window (~12 s default). If the connection hasn't returned to `connected` by then, the peer is force-closed and `peer-disconnect` fires.
+
+The signaling server may emit `#rtcio:peer-left` (the `rtc.io-server`'s `addDefaultListeners` does this automatically). The library treats this as a **hint** that's cross-checked against the local WebRTC state:
+
+- Hint + already-unhealthy P2P → clean up immediately.
+- Hint + still-healthy P2P → record the hint; do not tear down. The signaling socket can drop while the P2P connection over a TURN/STUN path stays alive (server crash, mobile data → wifi handoff). If the connection later goes unhealthy within ~30 s, the watchdog uses a shortened grace (~2.5 s) because both signals now agree.
+
+App code should listen on `peer-disconnect` for cleanup; that's the contract. `socket.server.on('user-disconnected', ...)` remains useful for *application-level* concerns like presence rosters but should not be used for tearing down per-peer media/state — let the library decide when a peer is gone.
 
 ---
 

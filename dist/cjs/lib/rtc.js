@@ -196,6 +196,8 @@ class Socket extends socket_io_client_1.Socket {
                 channels: {},
                 channelIds: new Map(),
                 connectFired: false,
+                unhealthyTimer: null,
+                peerLeftHintAt: 0,
             };
             const peer = this.rtcpeers[source];
             this.log('debug', `Created peer connection`, { peer: source, polite: options.polite });
@@ -266,35 +268,53 @@ class Socket extends socket_io_client_1.Socket {
                 };
                 this.emit(events_1.RtcioEvents.MESSAGE, eventPayload);
             };
-            // 'disconnected' is transient — ICE will self-recover or escalate to 'failed'.
-            peer.connection.oniceconnectionstatechange = () => {
-                this.log('debug', `ICE state: ${peer.connection.iceConnectionState}`, { peer: source });
-                switch (peer.connection.iceConnectionState) {
+            // connectionState aggregates ICE + DTLS — primary disconnect signal.
+            // We use it (rather than iceConnectionState) for the watchdog because
+            // it folds DTLS failures in, and the spec is more consistent across
+            // browsers about the transitions out of 'connected'.
+            peer.connection.onconnectionstatechange = () => {
+                const state = peer.connection.connectionState;
+                this.log('debug', `Connection state: ${state}`, { peer: source });
+                switch (state) {
+                    case "connected":
+                        // Healthy again — discard any in-flight watchdog. NAT
+                        // rebinding or an ICE restart can flip us back here from
+                        // 'disconnected' or 'failed'; we honour that recovery.
+                        this._clearUnhealthyTimer(peer);
+                        break;
                     case "disconnected":
+                        // Transient: ICE has stopped getting consent-freshness
+                        // responses. Browsers usually self-heal within a few
+                        // seconds. Arm the watchdog for the bounded grace window.
+                        this._armUnhealthyTimer(peer, "ICE consent lost");
                         break;
                     case "failed":
-                        peer.connection.restartIce();
-                        this.log('debug', 'ICE failed — restarting', { peer: source });
+                        // ICE has given up. Try one restart, then enforce the
+                        // watchdog — if the restart never gets answered (peer is
+                        // truly gone) we close the connection and tear down.
+                        try {
+                            peer.connection.restartIce();
+                            this.log('debug', 'Connection failed — restarting ICE', { peer: source });
+                        }
+                        catch (e) {
+                            this.log('warn', 'restartIce failed', { peer: source, e });
+                        }
+                        this._armUnhealthyTimer(peer, "ICE restart did not recover");
                         break;
                     case "closed":
                         this.cleanupPeer(source);
-                        break;
-                    default:
                         break;
                 }
             };
-            // connectionState aggregates ICE + DTLS — more reliable than
-            // iceConnectionState alone. Use as primary disconnect handler.
-            peer.connection.onconnectionstatechange = () => {
-                this.log('debug', `Connection state: ${peer.connection.connectionState}`, { peer: source });
-                switch (peer.connection.connectionState) {
-                    case "failed":
-                        peer.connection.restartIce();
-                        this.log('debug', 'Connection failed — restarting ICE', { peer: source });
-                        break;
-                    case "closed":
-                        this.cleanupPeer(source);
-                        break;
+            // iceConnectionState is a secondary signal: 'closed' here can fire
+            // without a matching connectionstatechange in some Firefox versions,
+            // so we also catch it as a cleanup trigger. The transient states
+            // ('disconnected'/'failed') are handled exclusively by the
+            // connectionState path above to avoid double-arming the watchdog.
+            peer.connection.oniceconnectionstatechange = () => {
+                this.log('debug', `ICE state: ${peer.connection.iceConnectionState}`, { peer: source });
+                if (peer.connection.iceConnectionState === "closed") {
+                    this.cleanupPeer(source);
                 }
             };
             peer.connection.onicecandidate = async (event) => {
@@ -357,6 +377,48 @@ class Socket extends socket_io_client_1.Socket {
             this._setupCtrlDc(ctrlDc, peer);
             return peer;
         };
+        /**
+         * Server-side peer-left hint handler. The signaling socket can drop
+         * independently of the WebRTC connection (server crash or restart, mobile
+         * data → wifi switch, signaling-only firewall change), so this is treated
+         * as advisory rather than authoritative:
+         *
+         *   - If the WebRTC layer already reports the connection as unhealthy
+         *     ('disconnected' or 'failed'), both signals agree and we clean up
+         *     immediately.
+         *   - Otherwise we record the hint timestamp. If the connection later
+         *     goes unhealthy within the validity window, the watchdog uses the
+         *     shortened grace period to clean up faster than ICE consent alone
+         *     would. If the connection stays healthy, the hint is silently
+         *     discarded — so a flaky signaling channel cannot tear down a
+         *     working P2P call.
+         */
+        this._handlePeerLeftHint = (payload) => {
+            const id = payload === null || payload === void 0 ? void 0 : payload.id;
+            if (!id)
+                return;
+            const peer = this.rtcpeers[id];
+            if (!peer)
+                return;
+            const state = peer.connection.connectionState;
+            if (state === "closed")
+                return;
+            peer.peerLeftHintAt = Date.now();
+            if (state === "disconnected" || state === "failed") {
+                this.log('debug', 'peer-left hint + unhealthy P2P → cleanup now', {
+                    peer: id, state,
+                });
+                try {
+                    peer.connection.close();
+                }
+                catch (_a) { }
+                this.cleanupPeer(id);
+                return;
+            }
+            this.log('debug', 'peer-left hint received; deferring to WebRTC liveness', {
+                peer: id, state,
+            });
+        };
         this.broadcastPeers = (cb, ...args) => {
             if (!this.connected)
                 return;
@@ -383,6 +445,15 @@ class Socket extends socket_io_client_1.Socket {
         this._rawOff = (ev, handler) => super.off(ev, handler);
         this.on(events_1.RtcioEvents.INIT_OFFER, this.initializeConnection);
         this.on(events_1.RtcioEvents.MESSAGE, this.enqueueSignalingMessage);
+        // The rtc.io-server fans this out to a leaving socket's rooms so peers
+        // can short-circuit ICE consent-freshness (~30 s) when a tab closes.
+        // We deliberately treat it as a hint: see _handlePeerLeftHint for why.
+        this._rawOn(events_1.RtcioEvents.PEER_LEFT, this._handlePeerLeftHint);
+        // Backwards-compatibility with servers that emit the older app-level
+        // `user-disconnected` event (including the public server.rtcio.dev and
+        // the rtc.io-server-example before this contract was promoted into
+        // the library). Same hint semantics as PEER_LEFT.
+        this._rawOn("user-disconnected", this._handlePeerLeftHint);
     }
     log(level, msg, data) {
         var _a, _b;
@@ -731,11 +802,67 @@ class Socket extends socket_io_client_1.Socket {
         }
         return data;
     }
+    // ─── Liveness watchdog ──────────────────────────────────────────────────
+    /**
+     * Armed when a peer's connectionState becomes 'disconnected' or 'failed'.
+     * If the peer hasn't returned to 'connected' by the time the timer fires,
+     * the connection is force-closed and `peer-disconnect` is emitted via
+     * `cleanupPeer`. The grace window shortens when a recent server-side
+     * peer-left hint corroborates that the peer is really gone.
+     *
+     * Re-arming clears any prior timer, so back-to-back state flips
+     * (disconnected → failed) reset the budget rather than racing two timers.
+     */
+    _armUnhealthyTimer(peer, reason) {
+        if (peer.unhealthyTimer)
+            clearTimeout(peer.unhealthyTimer);
+        const hintFresh = peer.peerLeftHintAt > 0 &&
+            Date.now() - peer.peerLeftHintAt < Socket.PEER_LEFT_HINT_VALIDITY_MS;
+        const ms = hintFresh
+            ? Socket.UNHEALTHY_GRACE_WITH_HINT_MS
+            : Socket.UNHEALTHY_GRACE_MS;
+        this.log('debug', 'Arming liveness watchdog', {
+            peer: peer.socketId, reason, ms, hintFresh,
+        });
+        peer.unhealthyTimer = setTimeout(() => {
+            peer.unhealthyTimer = null;
+            // Re-check current state — the connection may have recovered
+            // after the timer was scheduled but before it fired.
+            const state = peer.connection.connectionState;
+            if (state === "connected" || state === "closed")
+                return;
+            this.log('warn', `Liveness watchdog: forcing peer close (${reason})`, {
+                peer: peer.socketId, state,
+            });
+            try {
+                // Closing transitions connectionState → 'closed', which
+                // triggers the onconnectionstatechange handler above and runs
+                // cleanupPeer. We also call cleanupPeer directly because some
+                // browser/state combinations don't fire the state change after
+                // an explicit close on an already-failed connection — and
+                // cleanupPeer is idempotent so the duplicate is harmless.
+                peer.connection.close();
+            }
+            catch (e) {
+                this.log('warn', 'connection.close() threw during watchdog', {
+                    peer: peer.socketId, e,
+                });
+            }
+            this.cleanupPeer(peer.socketId);
+        }, ms);
+    }
+    _clearUnhealthyTimer(peer) {
+        if (peer.unhealthyTimer) {
+            clearTimeout(peer.unhealthyTimer);
+            peer.unhealthyTimer = null;
+        }
+    }
     cleanupPeer(peerId) {
         const peer = this.rtcpeers[peerId];
         if (!peer)
             return;
         this.log('debug', 'Cleaning up peer', { peer: peerId });
+        this._clearUnhealthyTimer(peer);
         // Close ctrl channel + clear pre-open queue
         if (peer.ctrlDc &&
             peer.ctrlDc.readyState !== "closed" &&
@@ -1033,3 +1160,19 @@ Socket.MAX_CTRL_QUEUE = 1024;
 // bulk transfers go through `createChannel(...).send(buffer)`, which never
 // hits this code path).
 Socket.MAX_CTRL_ENVELOPE_BYTES = 1048576;
+// Liveness watchdog windows. ICE consent freshness (RFC 7675) sends STUN
+// binding requests every ~5 s and gives up after ~30 s, so the browser
+// surfaces 'disconnected' within ~5–15 s of a peer disappearing and
+// 'failed' a short while later. We use that as the trigger and add a
+// bounded grace window for the connection to self-heal (NAT rebind, ICE
+// restart) before we declare the peer dead and tear down.
+Socket.UNHEALTHY_GRACE_MS = 12000;
+// When the server has *also* told us the peer left, both signals agree the
+// peer is most likely gone — shorten the grace window to clean up faster.
+// A small budget remains so we don't tear down on a transient signaling
+// flap that happened to coincide with a momentary ICE consent miss.
+Socket.UNHEALTHY_GRACE_WITH_HINT_MS = 2500;
+// How long a server-side peer-left hint stays "fresh" enough to shorten
+// the watchdog. Beyond this, the hint is ignored on the assumption that
+// we'd have observed the matching P2P trouble by now if it were real.
+Socket.PEER_LEFT_HINT_VALIDITY_MS = 30000;

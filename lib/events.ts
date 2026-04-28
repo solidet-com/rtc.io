@@ -5,6 +5,13 @@ export const RtcioEvents = {
     MESSAGE:     "#rtcio:message",
     STREAM_META: "#rtcio:stream-meta",
     INIT_OFFER:  "#rtcio:init-offer",
+    // Server → client. Fast-path notification that a socket disconnected, so
+    // peers can tear down the matching RTCPeerConnection without waiting on
+    // ICE consent-freshness (~30 s). The library also has a WebRTC-level
+    // watchdog that catches the same condition when this signal is missing
+    // (custom server, dropped packets), so this event is an optimisation
+    // rather than a load-bearing dependency.
+    PEER_LEFT:   "#rtcio:peer-left",
 } as const;
 
 export const INTERNAL_EVENT_PREFIX = "#rtcio:";
