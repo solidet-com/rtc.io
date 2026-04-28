@@ -40,6 +40,7 @@ export declare class Socket extends RootSocket {
     private streamEvents;
     private signalingQueues;
     debug: boolean;
+    private _signalingConnectedOnce;
     private readonly servers;
     private _peerListeners;
     private _channelDefs;
@@ -133,6 +134,18 @@ export declare class Socket extends RootSocket {
      *     discarded — so a flaky signaling channel cannot tear down a
      *     working P2P call.
      */
+    /**
+     * Fires every time the socket.io transport reaches `connected` — including
+     * reconnects after a drop. The first connect is just startup (no peers
+     * exist yet); from the second one onward, we walk the peer table and kick
+     * an ICE restart on anything that's currently `disconnected` or `failed`,
+     * so the recovery offer rides the freshly-restored signaling channel
+     * instead of a stale one from before the drop.
+     *
+     * The watchdog still owns the "give up" decision — this is a recovery
+     * accelerator, not a teardown trigger.
+     */
+    private _handleSignalingConnect;
     private _handlePeerLeftHint;
     private cleanupPeer;
     /**

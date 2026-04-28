@@ -123,6 +123,7 @@ These are emitted by the library and **filtered on receive** so peers can't spoo
 - `peer-connect` — fires when a peer's ctrl DataChannel opens
 - `peer-disconnect` — fires when a peer's connection is torn down (only after `peer-connect` fired)
 - `track-added` — late-arriving track on an existing remote stream
+- `track-removed` — track was dropped from an existing remote stream (peer stopped a camera, ended a screen share, etc.)
 
 Any event prefixed with `#rtcio:` is also reserved for internal signaling.
 

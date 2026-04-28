@@ -45,6 +45,10 @@ class Socket extends socket_io_client_1.Socket {
     constructor(io, nsp, opts) {
         var _a, _b;
         super(io, nsp, opts);
+        // True once the first socket.io `connect` event has fired. Subsequent
+        // `connect` events are reconnects, and we want to react to those (nudge
+        // stuck peers) rather than the initial handshake.
+        this._signalingConnectedOnce = false;
         // Serializes signaling per peer — prevents concurrent messages from interleaving async steps.
         // `.finally` detaches the chain when this is the tail so the per-peer entry can be GCd
         // instead of growing without bound for long-lived peers.
@@ -244,9 +248,15 @@ class Socket extends socket_io_client_1.Socket {
                     });
                     return;
                 }
-                peer.streams[stream.id] = new stream_1.RTCIOStream(stream);
+                const rtcioStream = new stream_1.RTCIOStream(stream);
+                peer.streams[stream.id] = rtcioStream;
                 // Handle tracks that arrive after the initial ontrack (e.g. video after audio).
-                stream.onaddtrack = ({ track: newTrack }) => {
+                // Subscribed via the wrapper so RTCIOStream.dispose() (called from
+                // cleanupPeer) detaches the listener — otherwise the closure would
+                // pin `peer` and `source` for the lifetime of the underlying
+                // MediaStream, which can outlive the peer if the app handed it to a
+                // `<video>` element.
+                rtcioStream.onTrackAdded((newTrack) => {
                     this.log('debug', 'Late track arrived via stream.onaddtrack', {
                         peer: source, kind: newTrack.kind, streamId: stream.id,
                     });
@@ -257,7 +267,24 @@ class Socket extends socket_io_client_1.Socket {
                             track: newTrack,
                         });
                     });
-                };
+                });
+                // Surface platform-driven track removals (remote peer stopped a
+                // track or removed it from the stream) to app code as
+                // `track-removed`. Like `track-added`, this only fires from
+                // platform mutations — programmatic `stream.removeTrack` on the
+                // local copy does not.
+                rtcioStream.onTrackRemoved((oldTrack) => {
+                    this.log('debug', 'Track removed by remote peer', {
+                        peer: source, kind: oldTrack.kind, streamId: stream.id,
+                    });
+                    this.listeners("track-removed").forEach((listener) => {
+                        listener({
+                            peerId: source,
+                            stream: stream,
+                            track: oldTrack,
+                        });
+                    });
+                });
                 // Request event metadata for this stream
                 const eventPayload = {
                     source: this.id,
@@ -393,6 +420,40 @@ class Socket extends socket_io_client_1.Socket {
          *     discarded — so a flaky signaling channel cannot tear down a
          *     working P2P call.
          */
+        /**
+         * Fires every time the socket.io transport reaches `connected` — including
+         * reconnects after a drop. The first connect is just startup (no peers
+         * exist yet); from the second one onward, we walk the peer table and kick
+         * an ICE restart on anything that's currently `disconnected` or `failed`,
+         * so the recovery offer rides the freshly-restored signaling channel
+         * instead of a stale one from before the drop.
+         *
+         * The watchdog still owns the "give up" decision — this is a recovery
+         * accelerator, not a teardown trigger.
+         */
+        this._handleSignalingConnect = () => {
+            if (!this._signalingConnectedOnce) {
+                this._signalingConnectedOnce = true;
+                return;
+            }
+            this.log('debug', 'Signaling reconnected — nudging unhealthy peers');
+            Object.values(this.rtcpeers).forEach((peer) => {
+                const state = peer.connection.connectionState;
+                if (state !== 'disconnected' && state !== 'failed')
+                    return;
+                try {
+                    peer.connection.restartIce();
+                    this.log('debug', 'Reconnect: restartIce on peer', {
+                        peer: peer.socketId, state,
+                    });
+                }
+                catch (e) {
+                    this.log('warn', 'Reconnect: restartIce failed', {
+                        peer: peer.socketId, e,
+                    });
+                }
+            });
+        };
         this._handlePeerLeftHint = (payload) => {
             const id = payload === null || payload === void 0 ? void 0 : payload.id;
             if (!id)
@@ -454,6 +515,23 @@ class Socket extends socket_io_client_1.Socket {
         // the rtc.io-server-example before this contract was promoted into
         // the library). Same hint semantics as PEER_LEFT.
         this._rawOn("user-disconnected", this._handlePeerLeftHint);
+        // socket.io-client auto-reconnects with infinite retries by default
+        // and buffers outgoing `emit` calls while disconnected, so most
+        // signaling traffic survives a transient drop without library help.
+        // Two cases need a nudge though:
+        //  1. A peer transitioned to 'failed' while signaling was down. Its
+        //     restartIce() ran locally but the resulting offer was buffered
+        //     and won't reach the remote until reconnect. The remote's view
+        //     can stay stuck in 'connected' across the gap (consent freshness
+        //     hasn't fired yet) — meaning when our offer finally lands, both
+        //     sides resume cleanly. Calling restartIce() again on reconnect
+        //     guarantees a fresh attempt is in flight at the moment signaling
+        //     is usable, instead of a stale one from before the drop.
+        //  2. ICE candidates that were trickling out during the drop were
+        //     buffered; restartIce() resets the candidate cycle so the
+        //     remote isn't trying to apply candidates from a dead generation.
+        // Initial connect is skipped — there are no peers to nudge yet.
+        this._rawOn("connect", this._handleSignalingConnect);
     }
     log(level, msg, data) {
         var _a, _b;

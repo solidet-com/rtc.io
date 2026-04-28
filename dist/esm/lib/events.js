@@ -23,4 +23,5 @@ export const RESERVED_EVENTS = new Set([
     "peer-connect",
     "peer-disconnect",
     "track-added",
+    "track-removed",
 ]);

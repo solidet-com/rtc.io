@@ -11,6 +11,20 @@ function randomId() {
 export class RTCIOStream {
     constructor(idOrMediaStream, mediaStream) {
         this.trackChangeCallbacks = [];
+        this.addTrackCallbacks = [];
+        this.removeTrackCallbacks = [];
+        // Platform-driven add: dispatch the stream-level onTrackChanged callbacks
+        // (back-compat) AND the per-track onTrackAdded callbacks (preferred for new
+        // code, since they hand the actual track to the listener and are cleaned
+        // up automatically by dispose()).
+        this.platformAddTrack = (e) => {
+            this.onTrackChange();
+            this.addTrackCallbacks.forEach(cb => cb(e.track));
+        };
+        this.platformRemoveTrack = (e) => {
+            this.onTrackChange();
+            this.removeTrackCallbacks.forEach(cb => cb(e.track));
+        };
         this.onTrackChange = () => {
             this.trackChangeCallbacks.forEach(callback => callback(this.mediaStream));
         };
@@ -27,13 +41,42 @@ export class RTCIOStream {
         // do *not* fire for programmatic addTrack/removeTrack. We listen anyway
         // to catch the platform-driven case, and the wrapper methods below
         // dispatch onTrackChange explicitly for the user-driven case.
-        this.mediaStream.addEventListener('addtrack', this.onTrackChange);
-        this.mediaStream.addEventListener('removetrack', this.onTrackChange);
+        this.mediaStream.addEventListener('addtrack', this.platformAddTrack);
+        this.mediaStream.addEventListener('removetrack', this.platformRemoveTrack);
     }
     onTrackChanged(callback) {
         this.trackChangeCallbacks.push(callback);
         return () => {
             this.trackChangeCallbacks = this.trackChangeCallbacks.filter(cb => cb !== callback);
+        };
+    }
+    /**
+     * Subscribes to platform-driven track additions on the underlying
+     * MediaStream — fires when the WebRTC stack hands the stream a new track
+     * (e.g. the remote peer added video after starting with audio only).
+     *
+     * Programmatic `addTrack()` calls do **not** fire this — use
+     * `onTrackChanged` for a callback that covers both. Returns an
+     * unsubscribe function. All registered callbacks are also cleared on
+     * `dispose()`, so library-internal listeners cannot outlive the wrapper.
+     */
+    onTrackAdded(callback) {
+        this.addTrackCallbacks.push(callback);
+        return () => {
+            this.addTrackCallbacks = this.addTrackCallbacks.filter(cb => cb !== callback);
+        };
+    }
+    /**
+     * Subscribes to platform-driven track removals on the underlying
+     * MediaStream — fires when the WebRTC stack drops a track from the stream
+     * (e.g. the remote peer stopped sharing screen). Programmatic
+     * `removeTrack()` calls do not fire this. Returns an unsubscribe function;
+     * callbacks are also cleared on `dispose()`.
+     */
+    onTrackRemoved(callback) {
+        this.removeTrackCallbacks.push(callback);
+        return () => {
+            this.removeTrackCallbacks = this.removeTrackCallbacks.filter(cb => cb !== callback);
         };
     }
     addTrack(track) {
@@ -74,9 +117,11 @@ export class RTCIOStream {
      * library calls this internally when a peer disconnects.
      */
     dispose() {
-        this.mediaStream.removeEventListener('addtrack', this.onTrackChange);
-        this.mediaStream.removeEventListener('removetrack', this.onTrackChange);
+        this.mediaStream.removeEventListener('addtrack', this.platformAddTrack);
+        this.mediaStream.removeEventListener('removetrack', this.platformRemoveTrack);
         this.trackChangeCallbacks = [];
+        this.addTrackCallbacks = [];
+        this.removeTrackCallbacks = [];
     }
     toJSON() {
         return `[RTCIOStream] ${this.id}`;

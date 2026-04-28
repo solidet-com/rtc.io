@@ -113,6 +113,7 @@ These fire from the library itself and are **filtered on receive** so peers cann
 | `peer-connect` | The ctrl DataChannel to a peer is open and usable | `{ id: peerId }` |
 | `peer-disconnect` | A peer that previously fired `peer-connect` is being torn down | `{ id: peerId }` |
 | `track-added` | A new track arrived on an *existing* remote stream | `{ peerId, stream, track }` |
+| `track-removed` | A track was dropped from an *existing* remote stream | `{ peerId, stream, track }` |
 
 Anything starting with `#rtcio:` is also reserved (internal signaling).
 
@@ -217,7 +218,7 @@ The library calls `RTCRtpSender.replaceTrack` on every peer — no SDP renegotia
 | --- | --- | --- |
 | Calling `new RTCPeerConnection()` directly | The library owns peer lifecycle | `socket.peer(id)` |
 | `socket.server.emit("chat", msg)` for app messages | Round-trips through the server, defeats the point | `socket.emit("chat", msg)` |
-| Emitting `peer-connect` / `peer-disconnect` / `track-added` from app code | Reserved events; the library filters them on receive | Pick a different name |
+| Emitting `peer-connect` / `peer-disconnect` / `track-added` / `track-removed` from app code | Reserved events; the library filters them on receive | Pick a different name |
 | Looping `getStats` every 100 ms | Allocates RTCStatsReport per call | Poll on a 1–3 s interval |
 | Recreating `socket = io(...)` on every render | Drops all connections | Create once at module scope (or in a `useRef`/`useState` initialiser) |
 | Sending a `File` directly via `socket.emit` | Files JSON-serialise to `{}` | Read into `ArrayBuffer` chunks and send via `createChannel(name).send(buf)` |
@@ -269,6 +270,37 @@ The signaling server may emit `#rtcio:peer-left` (the `rtc.io-server`'s `addDefa
 - Hint + still-healthy P2P → record the hint; do not tear down. The signaling socket can drop while the P2P connection over a TURN/STUN path stays alive (server crash, mobile data → wifi handoff). If the connection later goes unhealthy within ~30 s, the watchdog uses a shortened grace (~2.5 s) because both signals now agree.
 
 App code should listen on `peer-disconnect` for cleanup; that's the contract. `socket.server.on('user-disconnected', ...)` remains useful for *application-level* concerns like presence rosters but should not be used for tearing down per-peer media/state — let the library decide when a peer is gone.
+
+For *partial* departures — the peer stayed but stopped a track (e.g. ended a screen share, switched off camera) — listen on `track-removed`:
+
+```ts
+socket.on("track-removed", ({ peerId, stream, track }) => {
+  if (track.kind === "video" && stream.getVideoTracks().length === 0) {
+    hideVideoTile(peerId);
+  }
+});
+```
+
+The library wires this from `MediaStream`'s `removetrack` event, so it fires when the WebRTC stack drops the track from the remote stream — not when *you* mutate your local copy programmatically.
+
+## Signaling reconnect
+
+socket.io-client auto-reconnects by default (infinite retries, exponential backoff) and buffers `emit` calls during the outage. So if the signaling server is briefly unreachable, the library does the right thing without app intervention:
+
+- **Existing P2P connections survive.** They run over STUN/TURN, not the signaling server. A signaling drop does not kill an in-progress call.
+- **Buffered signaling flushes on reconnect.** Offers/answers/ICE candidates emitted during the outage land when the socket comes back.
+- **Stuck peers are nudged.** On every reconnect after the first, the library calls `restartIce()` on any peer that's currently in `disconnected` or `failed`, so their recovery offer rides the freshly-restored signaling path instead of a stale one.
+- **The peer-left hint is still authoritative-ish.** A `#rtcio:peer-left` that arrives after a long signaling outage still cross-checks WebRTC state — if the remote came back via NAT rebind and the connection is healthy, the hint is recorded but does not tear down.
+
+What you may still want to handle yourself:
+
+- **Re-joining the room.** socket.io's reconnect re-establishes the transport but does not replay your `join-room` emit. Many apps re-join on the `connect` event:
+
+  ```ts
+  socket.on("connect", () => socket.server.emit("join-room", { roomId, name }));
+  ```
+
+- **Stable identity across reconnects.** socket.io v4.6+ supports `connectionStateRecovery` on the server, which preserves `socket.id` across short drops. Without it, your reconnected client gets a new id; existing peers still see the old one until their watchdog expires. Use it for production deployments where reconnect churn matters.
 
 ---
 
