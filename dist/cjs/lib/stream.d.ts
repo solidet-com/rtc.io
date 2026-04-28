@@ -16,5 +16,12 @@ export declare class RTCIOStream {
      */
     replaceTrack(newTrack: MediaStreamTrack): MediaStreamTrack | null;
     replace(stream: MediaStream): void;
+    /**
+     * Detaches the platform-track-event listeners and drops user-registered
+     * callbacks. Call when you're done with the wrapper but the underlying
+     * MediaStream lives on (e.g. handing it off to a `<video>` element). The
+     * library calls this internally when a peer disconnects.
+     */
+    dispose(): void;
     toJSON(): string;
 }

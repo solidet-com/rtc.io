@@ -1,6 +1,13 @@
 # rtc.io
 
+[![npm](https://img.shields.io/npm/v/rtc.io.svg?style=flat-square)](https://www.npmjs.com/package/rtc.io)
+[![license](https://img.shields.io/npm/l/rtc.io.svg?style=flat-square)](./LICENSE)
+[![docs](https://img.shields.io/badge/docs-rtcio.dev-blue?style=flat-square)](https://docs.rtcio.dev)
+
 WebRTC peer-to-peer media and data channels with socket.io-style ergonomics.
+
+- 📦 [npm](https://www.npmjs.com/package/rtc.io) · 🐙 [GitHub](https://github.com/solidet-com/rtc.io) · 📖 [Docs](https://docs.rtcio.dev) · 🎬 [Live demo](https://rtcio.dev) · 🧠 [Why rtc.io](https://docs.rtcio.dev/why)
+- Working with an LLM? Hand it [`AGENTS.md`](./AGENTS.md) — a single-file primer written for AI coding assistants.
 
 ```bash
 npm install rtc.io rtc.io-server

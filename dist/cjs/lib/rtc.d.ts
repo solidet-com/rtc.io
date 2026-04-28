@@ -30,6 +30,7 @@ type connectionStatus = {
 };
 export declare class Socket extends RootSocket {
     private static readonly MAX_CTRL_QUEUE;
+    private static readonly MAX_CTRL_ENVELOPE_BYTES;
     private rtcpeers;
     private streamEvents;
     private signalingQueues;

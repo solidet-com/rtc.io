@@ -1,7 +1,7 @@
 {
 	"name": "rtc.io",
-	"version": "1.1.2",
-	"description": "WebRTC peer-to-peer media, data channels, and broadcast channels — built on socket.io for signaling.",
+	"version": "1.2.0",
+	"description": "Gold-standard WebRTC client for the browser. Peer-to-peer media streams, broadcast and per-peer DataChannels, perfect negotiation, ICE restart, backpressure, late-joiner stream replay — wrapped in a familiar socket.io emit/on API. Pairs with rtc.io-server for signaling.",
 	"main": "dist/cjs/index.js",
 	"module": "dist/esm/index.js",
 	"types": "dist/cjs/index.d.ts",
@@ -15,35 +15,73 @@
 	"files": [
 		"dist",
 		"README.md",
+		"AGENTS.md",
 		"LICENSE"
 	],
 	"keywords": [
 		"webrtc",
+		"webrtc-client",
+		"webrtc-library",
+		"rtc",
 		"rtc.io",
+		"rtcio",
 		"peer-to-peer",
 		"p2p",
 		"datachannel",
+		"data-channel",
 		"mediastream",
+		"media-stream",
 		"signaling",
+		"signaling-server",
 		"socket.io",
+		"socketio",
 		"realtime",
+		"real-time",
 		"streaming",
+		"video-chat",
+		"video-call",
+		"voice-chat",
 		"meeting",
-		"file-transfer"
+		"conference",
+		"file-transfer",
+		"screen-sharing",
+		"perfect-negotiation",
+		"ice",
+		"turn",
+		"stun",
+		"sctp",
+		"broadcast-channel",
+		"backpressure",
+		"low-latency",
+		"browser",
+		"typescript",
+		"peerjs-alternative",
+		"simple-peer-alternative"
 	],
 	"license": "MIT",
-	"author": "",
+	"author": "solidet-com",
+	"contributors": [
+		{
+			"name": "solidet-com",
+			"url": "https://github.com/solidet-com"
+		}
+	],
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/solidet-com/rtc.io.git"
+		"url": "git+https://github.com/solidet-com/rtc.io.git"
 	},
 	"bugs": {
 		"url": "https://github.com/solidet-com/rtc.io/issues"
 	},
-	"homepage": "https://github.com/solidet-com/rtc.io#readme",
+	"homepage": "https://docs.rtcio.dev",
+	"funding": {
+		"type": "github",
+		"url": "https://github.com/solidet-com/rtc.io"
+	},
 	"engines": {
 		"node": ">=18"
 	},
+	"sideEffects": false,
 	"scripts": {
 		"clean": "rm -rf dist",
 		"build": "npm run clean && tsc -p tsconfig.cjs.json && tsc -p tsconfig.esm.json",
@@ -51,8 +89,7 @@
 		"prepack": "npm run build"
 	},
 	"dependencies": {
-		"socket.io-client": "^4.7.4",
-		"uuid": "^11.1.0"
+		"socket.io-client": "^4.7.4"
 	},
 	"devDependencies": {
 		"@types/node": "^20.11.0",

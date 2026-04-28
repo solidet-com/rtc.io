@@ -580,9 +580,18 @@ class Socket extends socket_io_client_1.Socket {
                 this.log('debug', 'Sent answer', { peer: source });
             }
             // Defer so this handler finishes before onnegotiationneeded fires on stream replay.
+            // Re-check peer membership inside the microtask: between scheduling and
+            // execution, ICE could have failed and cleanupPeer() could have removed
+            // this peer entry, leaving us replaying onto a closed RTCPeerConnection.
             if (isNewPeer) {
-                queueMicrotask(() => this.replayStreamsToPeer(peer));
-                queueMicrotask(() => this._replayChannelsToPeer(peer));
+                queueMicrotask(() => {
+                    if (this.rtcpeers[peer.socketId] === peer)
+                        this.replayStreamsToPeer(peer);
+                });
+                queueMicrotask(() => {
+                    if (this.rtcpeers[peer.socketId] === peer)
+                        this._replayChannelsToPeer(peer);
+                });
             }
         }
         else if (candidate) {
@@ -605,7 +614,6 @@ class Socket extends socket_io_client_1.Socket {
                 this.listeners(key).forEach((listener) => {
                     // Deserialize the full args array, then spread — mirrors how socket.io
                     // dispatches events and correctly handles multi-arg emits.
-                    // .call(this) so once wrappers can call this.off() to unsubscribe.
                     // .call(this) so once wrappers can call this.off() to unsubscribe.
                     const args = events[key].map((arg) => this.deserializeStreamEvent(arg, rtcioStream));
                     listener.call(this, ...args);
@@ -737,6 +745,10 @@ class Socket extends socket_io_client_1.Socket {
         peer.ctrlQueue.length = 0;
         // Close all custom channels for this peer
         Object.values(peer.channels).forEach((ch) => ch.close());
+        // Detach RTCIOStream listeners on inbound streams so the wrapper does not
+        // pin the closed peer's MediaStream listeners. The MediaStream itself may
+        // outlive the peer if the app handed it to a `<video>` element.
+        Object.values(peer.streams).forEach((s) => { var _a; return (_a = s.dispose) === null || _a === void 0 ? void 0 : _a.call(s); });
         // Notify all broadcast channels so they fire 'peer-left' and update their peer maps
         this._broadcastChannels.forEach((bch) => bch._removePeer(peerId));
         // Drop per-peer listener registry
@@ -851,6 +863,12 @@ class Socket extends socket_io_client_1.Socket {
             var _a, _b;
             if (typeof data !== "string")
                 return;
+            if (data.length > Socket.MAX_CTRL_ENVELOPE_BYTES) {
+                this.log('warn', 'Ctrl: envelope exceeds max size, dropping', {
+                    peer: peer.socketId, bytes: data.length,
+                });
+                return;
+            }
             let envelope;
             try {
                 envelope = JSON.parse(data);
@@ -1008,3 +1026,10 @@ exports.Socket = Socket;
 // Bounded ctrl-channel buffer per peer. Drops oldest when full so a closed
 // or slow peer can't pin unbounded memory in long-lived sessions.
 Socket.MAX_CTRL_QUEUE = 1024;
+// Cap inbound ctrl-channel envelope size before we attempt to parse it. A
+// hostile peer could otherwise stream multi-megabyte JSON across multiple
+// SCTP messages and pin our event loop in JSON.parse. 1 MB is well above
+// any legitimate envelope (which carry user emit() args, not file data —
+// bulk transfers go through `createChannel(...).send(buffer)`, which never
+// hits this code path).
+Socket.MAX_CTRL_ENVELOPE_BYTES = 1048576;

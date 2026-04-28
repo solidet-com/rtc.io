@@ -1,7 +1,16 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.RTCIOStream = void 0;
-const uuid_1 = require("uuid");
+// crypto.randomUUID is available in all modern browsers and Node ≥19. We
+// avoid pulling in the `uuid` package (~9 KB) for a single call site.
+function randomId() {
+    const c = globalThis.crypto;
+    if (c === null || c === void 0 ? void 0 : c.randomUUID)
+        return c.randomUUID();
+    // Fallback: 8 random hex bytes is plenty to avoid collision per session
+    // in the rare environment without WebCrypto.
+    return Array.from({ length: 16 }, () => Math.floor(Math.random() * 256).toString(16).padStart(2, "0")).join("");
+}
 class RTCIOStream {
     constructor(idOrMediaStream, mediaStream) {
         this.trackChangeCallbacks = [];
@@ -9,7 +18,7 @@ class RTCIOStream {
             this.trackChangeCallbacks.forEach(callback => callback(this.mediaStream));
         };
         if (idOrMediaStream instanceof MediaStream) {
-            this.id = (0, uuid_1.v4)();
+            this.id = randomId();
             this.mediaStream = idOrMediaStream;
         }
         else {
@@ -60,6 +69,17 @@ class RTCIOStream {
         oldTracks.forEach(track => this.mediaStream.removeTrack(track));
         stream.getTracks().forEach(track => this.mediaStream.addTrack(track));
         this.onTrackChange();
+    }
+    /**
+     * Detaches the platform-track-event listeners and drops user-registered
+     * callbacks. Call when you're done with the wrapper but the underlying
+     * MediaStream lives on (e.g. handing it off to a `<video>` element). The
+     * library calls this internally when a peer disconnects.
+     */
+    dispose() {
+        this.mediaStream.removeEventListener('addtrack', this.onTrackChange);
+        this.mediaStream.removeEventListener('removetrack', this.onTrackChange);
+        this.trackChangeCallbacks = [];
     }
     toJSON() {
         return `[RTCIOStream] ${this.id}`;
