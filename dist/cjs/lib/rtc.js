@@ -523,11 +523,6 @@ class Socket extends socket_io_client_1.Socket {
         // can short-circuit ICE consent-freshness (~30 s) when a tab closes.
         // We deliberately treat it as a hint: see _handlePeerLeftHint for why.
         this._rawOn(events_1.RtcioEvents.PEER_LEFT, this._handlePeerLeftHint);
-        // Backwards-compatibility with servers that emit the older app-level
-        // `user-disconnected` event (including the public server.rtcio.dev and
-        // the rtc.io-server-example before this contract was promoted into
-        // the library). Same hint semantics as PEER_LEFT.
-        this._rawOn("user-disconnected", this._handlePeerLeftHint);
         // socket.io-client auto-reconnects with infinite retries by default
         // and buffers outgoing `emit` calls while disconnected, so most
         // signaling traffic survives a transient drop without library help.
