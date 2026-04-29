@@ -4,9 +4,87 @@ import { MessagePayload } from "./payload";
 import { RTCIOStream } from "./stream";
 import { RTCIOChannel, ChannelOptions } from "./channel";
 import { RTCIOBroadcastChannel } from "./broadcast-channel";
+export interface WatchdogOptions {
+    /**
+     * **Grace window — in milliseconds.**
+     *
+     * How long the library waits after a peer's `RTCPeerConnection.connectionState`
+     * flips to `'disconnected'` or `'failed'` before declaring the peer dead and
+     * tearing the connection down. The window absorbs transient ICE blips, NAT
+     * rebinds, and the recovery period of an automatic ICE restart.
+     *
+     * - Larger values (e.g. `30_000`) keep mobile/flaky networks more tolerant —
+     *   you trade a longer wait for resilience to brief outages.
+     * - Smaller values (e.g. `4_000`) free resources sooner — you trade tolerance
+     *   for snappy `peer-disconnect` events.
+     * - Must be a non-negative finite number. NaN, negative, or non-numeric
+     *   inputs are silently ignored and the default is used.
+     *
+     * @defaultValue `12_000` (12 seconds)
+     * @unit milliseconds
+     */
+    timeout?: number;
+    /**
+     * **Shortened grace window — in milliseconds.**
+     *
+     * Used in place of `timeout` when the signaling server has *also* reported
+     * the peer as gone (a `#rtcio:peer-left` hint received within `hintTTL`).
+     * Both signals corroborate the departure, so there is little reason to wait
+     * through the full ICE-blip allowance.
+     *
+     * - Set this equal to `timeout` to ignore server hints entirely.
+     * - Setting it lower than ~1_000 risks reaping peers during a momentary
+     *   ICE consent miss that happened to coincide with a signaling drop.
+     * - Must be a non-negative finite number.
+     *
+     * @defaultValue `2_500` (2.5 seconds)
+     * @unit milliseconds
+     */
+    hintTimeout?: number;
+    /**
+     * **Hint TTL — in milliseconds.**
+     *
+     * How long a server-side `peer-left` hint remains "fresh" enough to shorten
+     * the watchdog. Beyond this window the hint is treated as stale and ignored
+     * — on the assumption that if the peer were really gone, the WebRTC layer
+     * would have surfaced trouble (ICE consent freshness fails after ~30 s) by
+     * now.
+     *
+     * - Increase if your signaling traffic and WebRTC liveness can drift far
+     *   apart (e.g. severely throttled mobile networks).
+     * - Setting this to `0` disables the hint→shortened-window pathway entirely
+     *   without disabling immediate cleanup when state is already unhealthy.
+     * - Must be a non-negative finite number.
+     *
+     * @defaultValue `30_000` (30 seconds)
+     * @unit milliseconds
+     */
+    hintTTL?: number;
+}
 export interface SocketOptions extends Partial<RootSocketOptions> {
     iceServers: RTCIceServer[];
     debug?: boolean;
+    /**
+     * Per-peer liveness watchdog tuning. The watchdog decides when an unhealthy
+     * `RTCPeerConnection` should be force-closed and `peer-disconnect` fired.
+     *
+     * Every field is **in milliseconds** and is independently optional — omit
+     * one to keep its default. See {@link WatchdogOptions} for the full
+     * semantics of each knob.
+     *
+     * @example
+     * ```ts
+     * const socket = io(URL, {
+     *   iceServers: [...],
+     *   watchdog: {
+     *     timeout: 30_000,      // tolerate longer mobile rebinds (ms)
+     *     hintTimeout: 5_000,   // still react fast to corroborated hints (ms)
+     *     hintTTL: 60_000,      // accept hints from up to 60 s ago (ms)
+     *   },
+     * });
+     * ```
+     */
+    watchdog?: WatchdogOptions;
 }
 type RTCPeer = {
     connection: RTCPeerConnection;
@@ -33,9 +111,15 @@ type connectionStatus = {
 export declare class Socket extends RootSocket {
     private static readonly MAX_CTRL_QUEUE;
     private static readonly MAX_CTRL_ENVELOPE_BYTES;
-    private static readonly UNHEALTHY_GRACE_MS;
-    private static readonly UNHEALTHY_GRACE_WITH_HINT_MS;
-    private static readonly PEER_LEFT_HINT_VALIDITY_MS;
+    static readonly DEFAULT_WATCHDOG_TIMEOUT_MS = 12000;
+    static readonly DEFAULT_WATCHDOG_HINT_TIMEOUT_MS = 2500;
+    static readonly DEFAULT_PEER_LEFT_HINT_TTL_MS = 30000;
+    /** Resolved watchdog timeout, in milliseconds. See {@link WatchdogOptions.timeout}. */
+    private readonly watchdogTimeoutMs;
+    /** Resolved watchdog hint-shortened timeout, in milliseconds. See {@link WatchdogOptions.hintTimeout}. */
+    private readonly watchdogHintTimeoutMs;
+    /** Resolved peer-left hint TTL, in milliseconds. See {@link WatchdogOptions.hintTTL}. */
+    private readonly peerLeftHintTtlMs;
     private rtcpeers;
     private streamEvents;
     private signalingQueues;

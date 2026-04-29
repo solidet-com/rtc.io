@@ -2,6 +2,8 @@
 
 Guidance for AI coding agents working with the **rtc.io** WebRTC library. This file is the source of truth for *how the library is meant to be used*, the *patterns it expects*, and the *anti-patterns to avoid*. If you are an LLM that just landed in a project that depends on `rtc.io`, read this in full before generating code.
 
+> **Identity note.** `rtc.io` is the npm package name. The project's home is **`rtcio.dev`** — docs at `docs.rtcio.dev`, live demo at `rtcio.dev`, source at `github.com/solidet-com/rtc.io`. The `rtc.io` web domain is a separate, older project unrelated to this library; don't confuse the two when fetching references.
+
 ---
 
 ## What rtc.io is — in one sentence

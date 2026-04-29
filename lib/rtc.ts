@@ -16,9 +16,90 @@ import {
 import { RTCIOChannel, ChannelOptions } from "./channel";
 import { RTCIOBroadcastChannel } from "./broadcast-channel";
 
+export interface WatchdogOptions {
+	/**
+	 * **Grace window — in milliseconds.**
+	 *
+	 * How long the library waits after a peer's `RTCPeerConnection.connectionState`
+	 * flips to `'disconnected'` or `'failed'` before declaring the peer dead and
+	 * tearing the connection down. The window absorbs transient ICE blips, NAT
+	 * rebinds, and the recovery period of an automatic ICE restart.
+	 *
+	 * - Larger values (e.g. `30_000`) keep mobile/flaky networks more tolerant —
+	 *   you trade a longer wait for resilience to brief outages.
+	 * - Smaller values (e.g. `4_000`) free resources sooner — you trade tolerance
+	 *   for snappy `peer-disconnect` events.
+	 * - Must be a non-negative finite number. NaN, negative, or non-numeric
+	 *   inputs are silently ignored and the default is used.
+	 *
+	 * @defaultValue `12_000` (12 seconds)
+	 * @unit milliseconds
+	 */
+	timeout?: number;
+
+	/**
+	 * **Shortened grace window — in milliseconds.**
+	 *
+	 * Used in place of `timeout` when the signaling server has *also* reported
+	 * the peer as gone (a `#rtcio:peer-left` hint received within `hintTTL`).
+	 * Both signals corroborate the departure, so there is little reason to wait
+	 * through the full ICE-blip allowance.
+	 *
+	 * - Set this equal to `timeout` to ignore server hints entirely.
+	 * - Setting it lower than ~1_000 risks reaping peers during a momentary
+	 *   ICE consent miss that happened to coincide with a signaling drop.
+	 * - Must be a non-negative finite number.
+	 *
+	 * @defaultValue `2_500` (2.5 seconds)
+	 * @unit milliseconds
+	 */
+	hintTimeout?: number;
+
+	/**
+	 * **Hint TTL — in milliseconds.**
+	 *
+	 * How long a server-side `peer-left` hint remains "fresh" enough to shorten
+	 * the watchdog. Beyond this window the hint is treated as stale and ignored
+	 * — on the assumption that if the peer were really gone, the WebRTC layer
+	 * would have surfaced trouble (ICE consent freshness fails after ~30 s) by
+	 * now.
+	 *
+	 * - Increase if your signaling traffic and WebRTC liveness can drift far
+	 *   apart (e.g. severely throttled mobile networks).
+	 * - Setting this to `0` disables the hint→shortened-window pathway entirely
+	 *   without disabling immediate cleanup when state is already unhealthy.
+	 * - Must be a non-negative finite number.
+	 *
+	 * @defaultValue `30_000` (30 seconds)
+	 * @unit milliseconds
+	 */
+	hintTTL?: number;
+}
+
 export interface SocketOptions extends Partial<RootSocketOptions> {
 	iceServers: RTCIceServer[];
 	debug?: boolean;
+	/**
+	 * Per-peer liveness watchdog tuning. The watchdog decides when an unhealthy
+	 * `RTCPeerConnection` should be force-closed and `peer-disconnect` fired.
+	 *
+	 * Every field is **in milliseconds** and is independently optional — omit
+	 * one to keep its default. See {@link WatchdogOptions} for the full
+	 * semantics of each knob.
+	 *
+	 * @example
+	 * ```ts
+	 * const socket = io(URL, {
+	 *   iceServers: [...],
+	 *   watchdog: {
+	 *     timeout: 30_000,      // tolerate longer mobile rebinds (ms)
+	 *     hintTimeout: 5_000,   // still react fast to corroborated hints (ms)
+	 *     hintTTL: 60_000,      // accept hints from up to 60 s ago (ms)
+	 *   },
+	 * });
+	 * ```
+	 */
+	watchdog?: WatchdogOptions;
 }
 
 /**
@@ -35,6 +116,16 @@ export interface SocketOptions extends Partial<RootSocketOptions> {
  * Hash collisions are detected per-peer and surface as a clear error to the
  * caller (see `_getOrCreateChannel`).
  */
+/**
+ * Resolve a numeric option: use the user value if it's a finite, non-negative
+ * number, otherwise fall back to the default. Negative or NaN inputs would
+ * arm a `setTimeout` with garbage and cause an immediate fire — silently
+ * ignoring them keeps the watchdog stable in the face of accidental misuse.
+ */
+function pickPositive(value: number | undefined, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
 function hashChannelName(name: string): number {
 	// FNV-1a 32-bit
 	let h = 0x811c9dc5;
@@ -92,22 +183,33 @@ export class Socket extends RootSocket {
 	// hits this code path).
 	private static readonly MAX_CTRL_ENVELOPE_BYTES = 1_048_576;
 
-	// Liveness watchdog windows. ICE consent freshness (RFC 7675) sends STUN
-	// binding requests every ~5 s and gives up after ~30 s, so the browser
-	// surfaces 'disconnected' within ~5–15 s of a peer disappearing and
-	// 'failed' a short while later. We use that as the trigger and add a
-	// bounded grace window for the connection to self-heal (NAT rebind, ICE
-	// restart) before we declare the peer dead and tear down.
-	private static readonly UNHEALTHY_GRACE_MS = 12_000;
+	// Liveness watchdog defaults — all values in milliseconds.
+	//
+	// ICE consent freshness (RFC 7675) sends STUN binding requests every ~5 s
+	// and gives up after ~30 s, so the browser surfaces 'disconnected' within
+	// ~5–15 s of a peer disappearing and 'failed' a short while later. We use
+	// that as the trigger and add a bounded grace window for the connection
+	// to self-heal (NAT rebind, ICE restart) before we declare the peer dead
+	// and tear down. Override per socket via `opts.watchdog` — the resolved
+	// values land on the `watchdogTimeoutMs` / `watchdogHintTimeoutMs` /
+	// `peerLeftHintTtlMs` instance fields below.
+	public static readonly DEFAULT_WATCHDOG_TIMEOUT_MS = 12_000;
 	// When the server has *also* told us the peer left, both signals agree the
 	// peer is most likely gone — shorten the grace window to clean up faster.
 	// A small budget remains so we don't tear down on a transient signaling
 	// flap that happened to coincide with a momentary ICE consent miss.
-	private static readonly UNHEALTHY_GRACE_WITH_HINT_MS = 2_500;
+	public static readonly DEFAULT_WATCHDOG_HINT_TIMEOUT_MS = 2_500;
 	// How long a server-side peer-left hint stays "fresh" enough to shorten
 	// the watchdog. Beyond this, the hint is ignored on the assumption that
 	// we'd have observed the matching P2P trouble by now if it were real.
-	private static readonly PEER_LEFT_HINT_VALIDITY_MS = 30_000;
+	public static readonly DEFAULT_PEER_LEFT_HINT_TTL_MS = 30_000;
+
+	/** Resolved watchdog timeout, in milliseconds. See {@link WatchdogOptions.timeout}. */
+	private readonly watchdogTimeoutMs: number;
+	/** Resolved watchdog hint-shortened timeout, in milliseconds. See {@link WatchdogOptions.hintTimeout}. */
+	private readonly watchdogHintTimeoutMs: number;
+	/** Resolved peer-left hint TTL, in milliseconds. See {@link WatchdogOptions.hintTTL}. */
+	private readonly peerLeftHintTtlMs: number;
 
 	private rtcpeers: Record<string, RTCPeer>;
 	private streamEvents: Record<string, any>; // Events Payloads including RTCIOStream, stream.id:event-payload
@@ -136,6 +238,11 @@ export class Socket extends RootSocket {
 				? opts.iceServers
 				: [{ urls: ["stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"] }],
 		};
+
+		const wd = opts?.watchdog;
+		this.watchdogTimeoutMs = pickPositive(wd?.timeout, Socket.DEFAULT_WATCHDOG_TIMEOUT_MS);
+		this.watchdogHintTimeoutMs = pickPositive(wd?.hintTimeout, Socket.DEFAULT_WATCHDOG_HINT_TIMEOUT_MS);
+		this.peerLeftHintTtlMs = pickPositive(wd?.hintTTL, Socket.DEFAULT_PEER_LEFT_HINT_TTL_MS);
 
 		this.rtcpeers = {};
 		this.streamEvents = {};
@@ -973,10 +1080,10 @@ export class Socket extends RootSocket {
 
 		const hintFresh =
 			peer.peerLeftHintAt > 0 &&
-			Date.now() - peer.peerLeftHintAt < Socket.PEER_LEFT_HINT_VALIDITY_MS;
+			Date.now() - peer.peerLeftHintAt < this.peerLeftHintTtlMs;
 		const ms = hintFresh
-			? Socket.UNHEALTHY_GRACE_WITH_HINT_MS
-			: Socket.UNHEALTHY_GRACE_MS;
+			? this.watchdogHintTimeoutMs
+			: this.watchdogTimeoutMs;
 
 		this.log('debug', 'Arming liveness watchdog', {
 			peer: peer.socketId, reason, ms, hintFresh,

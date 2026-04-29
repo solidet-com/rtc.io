@@ -32,6 +32,15 @@ const broadcast_channel_1 = require("./broadcast-channel");
  * Hash collisions are detected per-peer and surface as a clear error to the
  * caller (see `_getOrCreateChannel`).
  */
+/**
+ * Resolve a numeric option: use the user value if it's a finite, non-negative
+ * number, otherwise fall back to the default. Negative or NaN inputs would
+ * arm a `setTimeout` with garbage and cause an immediate fire — silently
+ * ignoring them keeps the watchdog stable in the face of accidental misuse.
+ */
+function pickPositive(value, fallback) {
+    return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
 function hashChannelName(name) {
     // FNV-1a 32-bit
     let h = 0x811c9dc5;
@@ -492,6 +501,10 @@ class Socket extends socket_io_client_1.Socket {
                 ? opts.iceServers
                 : [{ urls: ["stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"] }],
         };
+        const wd = opts === null || opts === void 0 ? void 0 : opts.watchdog;
+        this.watchdogTimeoutMs = pickPositive(wd === null || wd === void 0 ? void 0 : wd.timeout, Socket.DEFAULT_WATCHDOG_TIMEOUT_MS);
+        this.watchdogHintTimeoutMs = pickPositive(wd === null || wd === void 0 ? void 0 : wd.hintTimeout, Socket.DEFAULT_WATCHDOG_HINT_TIMEOUT_MS);
+        this.peerLeftHintTtlMs = pickPositive(wd === null || wd === void 0 ? void 0 : wd.hintTTL, Socket.DEFAULT_PEER_LEFT_HINT_TTL_MS);
         this.rtcpeers = {};
         this.streamEvents = {};
         this.signalingQueues = {};
@@ -895,10 +908,10 @@ class Socket extends socket_io_client_1.Socket {
         if (peer.unhealthyTimer)
             clearTimeout(peer.unhealthyTimer);
         const hintFresh = peer.peerLeftHintAt > 0 &&
-            Date.now() - peer.peerLeftHintAt < Socket.PEER_LEFT_HINT_VALIDITY_MS;
+            Date.now() - peer.peerLeftHintAt < this.peerLeftHintTtlMs;
         const ms = hintFresh
-            ? Socket.UNHEALTHY_GRACE_WITH_HINT_MS
-            : Socket.UNHEALTHY_GRACE_MS;
+            ? this.watchdogHintTimeoutMs
+            : this.watchdogTimeoutMs;
         this.log('debug', 'Arming liveness watchdog', {
             peer: peer.socketId, reason, ms, hintFresh,
         });
@@ -1238,19 +1251,23 @@ Socket.MAX_CTRL_QUEUE = 1024;
 // bulk transfers go through `createChannel(...).send(buffer)`, which never
 // hits this code path).
 Socket.MAX_CTRL_ENVELOPE_BYTES = 1048576;
-// Liveness watchdog windows. ICE consent freshness (RFC 7675) sends STUN
-// binding requests every ~5 s and gives up after ~30 s, so the browser
-// surfaces 'disconnected' within ~5–15 s of a peer disappearing and
-// 'failed' a short while later. We use that as the trigger and add a
-// bounded grace window for the connection to self-heal (NAT rebind, ICE
-// restart) before we declare the peer dead and tear down.
-Socket.UNHEALTHY_GRACE_MS = 12000;
+// Liveness watchdog defaults — all values in milliseconds.
+//
+// ICE consent freshness (RFC 7675) sends STUN binding requests every ~5 s
+// and gives up after ~30 s, so the browser surfaces 'disconnected' within
+// ~5–15 s of a peer disappearing and 'failed' a short while later. We use
+// that as the trigger and add a bounded grace window for the connection
+// to self-heal (NAT rebind, ICE restart) before we declare the peer dead
+// and tear down. Override per socket via `opts.watchdog` — the resolved
+// values land on the `watchdogTimeoutMs` / `watchdogHintTimeoutMs` /
+// `peerLeftHintTtlMs` instance fields below.
+Socket.DEFAULT_WATCHDOG_TIMEOUT_MS = 12000;
 // When the server has *also* told us the peer left, both signals agree the
 // peer is most likely gone — shorten the grace window to clean up faster.
 // A small budget remains so we don't tear down on a transient signaling
 // flap that happened to coincide with a momentary ICE consent miss.
-Socket.UNHEALTHY_GRACE_WITH_HINT_MS = 2500;
+Socket.DEFAULT_WATCHDOG_HINT_TIMEOUT_MS = 2500;
 // How long a server-side peer-left hint stays "fresh" enough to shorten
 // the watchdog. Beyond this, the hint is ignored on the assumption that
 // we'd have observed the matching P2P trouble by now if it were real.
-Socket.PEER_LEFT_HINT_VALIDITY_MS = 30000;
+Socket.DEFAULT_PEER_LEFT_HINT_TTL_MS = 30000;
