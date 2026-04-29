@@ -1,6 +1,6 @@
 {
 	"name": "rtc.io",
-	"version": "1.5.1",
+	"version": "1.5.2",
 	"description": "Gold-standard WebRTC client for the browser. Peer-to-peer media streams, broadcast and per-peer DataChannels, perfect negotiation, ICE restart, backpressure, late-joiner stream replay — wrapped in a familiar socket.io emit/on API. Pairs with rtc.io-server for signaling.",
 	"main": "dist/cjs/index.js",
 	"module": "dist/esm/index.js",
