@@ -6,7 +6,9 @@ export interface ChannelOptions {
 	ordered?: boolean;
 	maxRetransmits?: number;
 	maxPacketLifeTime?: number;
-	queueBudget?: number; // library-specific, not passed to RTCDataChannel
+	queueBudget?: number;     // library-specific, not passed to RTCDataChannel
+	highWatermark?: number;   // library-specific, not passed to RTCDataChannel
+	lowWatermark?: number;    // library-specific, not passed to RTCDataChannel
 }
 
 type Listener = (...args: any[]) => void;
@@ -17,15 +19,23 @@ export class RTCIOChannel {
 	private _queue: Array<string | ArrayBuffer> = [];
 	private _queueBytes = 0;
 	private readonly _queueBudget: number;
+	private readonly _highWatermark: number;
+	private readonly _lowWatermark: number;
 
-	constructor(queueBudget: number = QUEUE_BUDGET) {
+	constructor(
+		queueBudget: number = QUEUE_BUDGET,
+		highWatermark: number = HIGH_WATERMARK,
+		lowWatermark: number = LOW_WATERMARK,
+	) {
 		this._queueBudget = queueBudget;
+		this._highWatermark = highWatermark;
+		this._lowWatermark = lowWatermark;
 	}
 
 	_attach(dc: RTCDataChannel): void {
 		this._dc = dc;
 		dc.binaryType = "arraybuffer";
-		dc.bufferedAmountLowThreshold = LOW_WATERMARK;
+		dc.bufferedAmountLowThreshold = this._lowWatermark;
 
 		dc.onopen = () => {
 			this._flush();
@@ -152,7 +162,7 @@ export class RTCIOChannel {
 		if (
 			dc &&
 			dc.readyState === "open" &&
-			dc.bufferedAmount < HIGH_WATERMARK &&
+			dc.bufferedAmount < this._highWatermark &&
 			this._queue.length === 0
 		) {
 			try {
@@ -187,7 +197,7 @@ export class RTCIOChannel {
 		while (this._queue.length > 0) {
 			const dc = this._dc;
 			if (!dc || dc.readyState !== "open") break;
-			if (dc.bufferedAmount >= HIGH_WATERMARK) break;
+			if (dc.bufferedAmount >= this._highWatermark) break;
 
 			const item = this._queue.shift()!;
 			const size =
