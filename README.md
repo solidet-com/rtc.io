@@ -56,15 +56,25 @@ const socket = io("http://localhost:3001", {
   iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
 });
 
-socket.server.emit("join-room", { roomId: "demo", name: "alice" });
 
-// Get local media.
 const local = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-socket.emit("camera", new RTCIOStream(local));
+const camera = new RTCIOStream(local);
+
+socket.server.emit("join-room", { roomId: "demo", name: "alice" });
+socket.emit("camera", camera);
+
+// You can ship app-level metadata alongside the stream in the same emit.
+// The library walks the args looking for any RTCIOStream and preserves
+// the rest of the payload verbatim:
+socket.emit("camera", {
+  stream: camera,
+  metadata: { displayName: "Alice", userId: "abc123" },
+});
 
 // Receive remote streams.
-socket.on("camera", (stream: RTCIOStream) => {
+socket.on("camera", ({ stream, metadata }: { stream: RTCIOStream; metadata: { displayName: string; userId: string } }) => {
   videoEl.srcObject = stream.mediaStream;
+  label.textContent = metadata.displayName;
 });
 
 socket.on("peer-connect", ({ id }) => console.log("peer joined:", id));
@@ -89,7 +99,13 @@ chat.emit("msg", "hi everyone");
 ### Custom DataChannel with backpressure
 
 ```ts
-const file = socket.peer(peerId).createChannel("file", { ordered: true });
+const file = socket.peer(peerId).createChannel("file", {
+  ordered: true,
+  // All three knobs are per-channel and optional.
+  queueBudget:   16 * 1024 * 1024,   // JS-side cap (default 1 MB)
+  highWatermark: 16 * 1024 * 1024,   // pause threshold (default 16 MB)
+  lowWatermark:   4 * 1024 * 1024,   // 'drain' fires at this level (default 1 MB)
+});
 
 file.on("open", () => {
   // Send chunks; the channel will pause and emit 'drain' when full.
@@ -100,6 +116,8 @@ file.on("open", () => {
   }
 });
 ```
+
+Defaults work for most apps. Lower `highWatermark` for tighter memory caps; raise it for fat-pipe LAN bulk transfers. Keep `lowWatermark` below `highWatermark` — otherwise `'drain'` fires on every send and the throttling collapses. See [Backpressure & flow control](https://docs.rtcio.dev/docs/guides/backpressure) for the tuning guide.
 
 ## API surface
 

@@ -2,17 +2,19 @@ export const HIGH_WATERMARK = 16777216; // 16 MB — pause sending above this
 export const LOW_WATERMARK = 1048576; //  1 MB — resume sending below this
 export const QUEUE_BUDGET = 1048576; //  1 MB default pre-open queue budget
 export class RTCIOChannel {
-    constructor(queueBudget = QUEUE_BUDGET) {
+    constructor(queueBudget = QUEUE_BUDGET, highWatermark = HIGH_WATERMARK, lowWatermark = LOW_WATERMARK) {
         this._dc = null;
         this._listeners = new Map();
         this._queue = [];
         this._queueBytes = 0;
         this._queueBudget = queueBudget;
+        this._highWatermark = highWatermark;
+        this._lowWatermark = lowWatermark;
     }
     _attach(dc) {
         this._dc = dc;
         dc.binaryType = "arraybuffer";
-        dc.bufferedAmountLowThreshold = LOW_WATERMARK;
+        dc.bufferedAmountLowThreshold = this._lowWatermark;
         dc.onopen = () => {
             this._flush();
             this._dispatchLocal("open");
@@ -125,7 +127,7 @@ export class RTCIOChannel {
         const dc = this._dc;
         if (dc &&
             dc.readyState === "open" &&
-            dc.bufferedAmount < HIGH_WATERMARK &&
+            dc.bufferedAmount < this._highWatermark &&
             this._queue.length === 0) {
             try {
                 dc.send(data);
@@ -153,7 +155,7 @@ export class RTCIOChannel {
             const dc = this._dc;
             if (!dc || dc.readyState !== "open")
                 break;
-            if (dc.bufferedAmount >= HIGH_WATERMARK)
+            if (dc.bufferedAmount >= this._highWatermark)
                 break;
             const item = this._queue.shift();
             const size = typeof item === "string"

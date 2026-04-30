@@ -990,10 +990,10 @@ export class Socket extends RootSocket {
         const peer = this.rtcpeers[peerId];
         // Detached channel for unknown peer — user error; will never wire up.
         if (!peer)
-            return new RTCIOChannel(options.queueBudget);
+            return new RTCIOChannel(options.queueBudget, options.highWatermark, options.lowWatermark);
         let channel = peer.channels[name];
         if (!channel) {
-            channel = new RTCIOChannel(options.queueBudget);
+            channel = new RTCIOChannel(options.queueBudget, options.highWatermark, options.lowWatermark);
             peer.channels[name] = channel;
         }
         if (!channel._isAttached()) {
@@ -1004,7 +1004,7 @@ export class Socket extends RootSocket {
                     `(both names hash to SCTP id ${id}). Pick a different channel name.`);
             }
             peer.channelIds.set(id, name);
-            const { queueBudget: _qb } = options, dcInit = __rest(options, ["queueBudget"]);
+            const { queueBudget: _qb, highWatermark: _hw, lowWatermark: _lw } = options, dcInit = __rest(options, ["queueBudget", "highWatermark", "lowWatermark"]);
             const dc = peer.connection.createDataChannel(`${CUSTOM_CHANNEL_PREFIX}${name}`, Object.assign(Object.assign({}, dcInit), { negotiated: true, id }));
             channel._attach(dc);
         }

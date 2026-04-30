@@ -91,6 +91,19 @@ const old = stream.replaceTrack(newCam);
 old?.stop();
 ```
 
+### Streams + arbitrary metadata
+
+`socket.emit` deep-walks the args looking for any `RTCIOStream`. The rest of the payload is preserved verbatim, so you can ship app-level metadata alongside the stream in the same emit — no separate ctrl event needed:
+
+```ts
+// ✅ Works — the library finds the RTCIOStream nested inside the object
+socket.emit("stream", {
+  screen: new RTCIOStream(displayStream),
+  metadata: { userId: "abc123", displayName: "Alice", dummyKey:"dummyData"},
+});
+
+
+
 ### Server escape hatch
 
 ```ts
@@ -173,6 +186,34 @@ for (const chunk of chunks) {
 ```
 
 `channel.send()` returning `false` means the chunk was queued (or refused if the queue budget is exceeded — listen for `error` to detect that). Wait for `drain` before pushing more. The library will not protect you from filling the queue beyond `queueBudget`; that's your job.
+
+**Three knobs, all per-channel:**
+
+| Option | Default | Role |
+|---|---|---|
+| `queueBudget` | 1 MB | Hard cap on the JS-side queue (bytes held while the DC is connecting or above high-water). Exceeding fires `error`. |
+| `highWatermark` | 16 MB | `bufferedAmount` threshold above which `send()` returns `false` and the library queues. |
+| `lowWatermark` | 1 MB | `bufferedAmount` value at which `'drain'` fires. Wired to `RTCDataChannel.bufferedAmountLowThreshold`. |
+
+All three are accepted by `createChannel`:
+
+```ts
+// Bulk LAN transfer — deeper pipeline, more memory, smoother throughput.
+const bulk = socket.peer(id).createChannel("bulk", {
+  ordered: true,
+  queueBudget:   64 * 1024 * 1024,
+  highWatermark: 64 * 1024 * 1024,
+  lowWatermark:  16 * 1024 * 1024,
+});
+
+// Tight memory / latency-sensitive — pause early, drain fully.
+const tight = socket.peer(id).createChannel("ctrl-stream", {
+  highWatermark: 1 * 1024 * 1024,
+  lowWatermark:  256 * 1024,
+});
+```
+
+Constraint: `lowWatermark < highWatermark`, otherwise `'drain'` fires every send and the throttling defeats itself. The library doesn't enforce it.
 
 ### 5. Both ends of a per-peer custom channel must call `createChannel`
 

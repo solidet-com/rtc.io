@@ -6,6 +6,8 @@ export interface ChannelOptions {
     maxRetransmits?: number;
     maxPacketLifeTime?: number;
     queueBudget?: number;
+    highWatermark?: number;
+    lowWatermark?: number;
 }
 type Listener = (...args: any[]) => void;
 export declare class RTCIOChannel {
@@ -14,7 +16,9 @@ export declare class RTCIOChannel {
     private _queue;
     private _queueBytes;
     private readonly _queueBudget;
-    constructor(queueBudget?: number);
+    private readonly _highWatermark;
+    private readonly _lowWatermark;
+    constructor(queueBudget?: number, highWatermark?: number, lowWatermark?: number);
     _attach(dc: RTCDataChannel): void;
     _isAttached(): boolean;
     emit(eventName: string, ...args: any[]): void;
