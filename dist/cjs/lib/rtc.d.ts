@@ -182,6 +182,26 @@ export declare class Socket extends RootSocket {
     }): RTCPeer;
     serializeStreamEvent(data: any): any;
     deserializeStreamEvent(data: any, rtcioStream: RTCIOStream): any;
+    /**
+     * Apply user-configured codec preferences to a transceiver. Must be called
+     * synchronously after `addTransceiver` (and before the next SDP offer)
+     * because `setCodecPreferences` reorders/filters the codec list that goes
+     * into the m-line. No-op if the stream has no `codecPreferences`
+     * callback, the browser doesn't support the API, or the callback returns
+     * an empty list (treated as "leave the default order alone").
+     */
+    private applyCodecPreferences;
+    /**
+     * Wire a transceiver that we've just associated with `rtcioStream`:
+     *
+     *   - Apply codec preferences (must run before negotiation).
+     *   - Apply video encoding params (`maxBitrate`, `degradationPreference`,
+     *     etc.) — async; fired-and-forgotten because it doesn't affect SDP.
+     *   - Register the sender with the stream so `setEncoding()` can re-apply
+     *     params at runtime, and unregistration on peer cleanup keeps the
+     *     registry from leaking dead senders.
+     */
+    private wireTransceiverForStream;
     private addTransceiverToPeer;
     /**
      * Creates peer connection

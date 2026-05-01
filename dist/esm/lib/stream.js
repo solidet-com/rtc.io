@@ -9,15 +9,35 @@ function randomId() {
     return Array.from({ length: 16 }, () => Math.floor(Math.random() * 256).toString(16).padStart(2, "0")).join("");
 }
 export class RTCIOStream {
-    constructor(idOrMediaStream, mediaStream) {
+    constructor(idOrMediaStream, mediaStreamOrOptions, options) {
+        var _a;
         this.trackChangeCallbacks = [];
         this.addTrackCallbacks = [];
         this.removeTrackCallbacks = [];
+        // peerId → senders we created for this stream on that peer. Populated by
+        // the library at addTransceiver time; cleared on peer cleanup. Drives
+        // setEncoding() runtime updates.
+        this._trackedSenders = new Map();
+        this.applyContentHintTo = (track) => {
+            var _a;
+            if (track.kind !== 'video')
+                return;
+            const hint = (_a = this._options.videoEncoding) === null || _a === void 0 ? void 0 : _a.contentHint;
+            if (hint === undefined)
+                return;
+            try {
+                track.contentHint = hint;
+            }
+            catch (_b) {
+                // Older browsers without contentHint support — silently no-op.
+            }
+        };
         // Platform-driven add: dispatch the stream-level onTrackChanged callbacks
         // (back-compat) AND the per-track onTrackAdded callbacks (preferred for new
         // code, since they hand the actual track to the listener and are cleaned
         // up automatically by dispose()).
         this.platformAddTrack = (e) => {
+            this.applyContentHintTo(e.track);
             this.onTrackChange();
             this.addTrackCallbacks.forEach(cb => cb(e.track));
         };
@@ -31,11 +51,15 @@ export class RTCIOStream {
         if (idOrMediaStream instanceof MediaStream) {
             this.id = randomId();
             this.mediaStream = idOrMediaStream;
+            this._options = (_a = mediaStreamOrOptions) !== null && _a !== void 0 ? _a : {};
         }
         else {
             this.id = idOrMediaStream;
-            this.mediaStream = mediaStream;
+            this.mediaStream = mediaStreamOrOptions;
+            this._options = options !== null && options !== void 0 ? options : {};
         }
+        // Apply contentHint to any tracks already on the stream at construction.
+        this.applyContentHintToAll();
         // MediaStream's `addtrack` / `removetrack` events only fire when the
         // platform mutates the stream (e.g. WebRTC adds a remote track) — they
         // do *not* fire for programmatic addTrack/removeTrack. We listen anyway
@@ -43,6 +67,41 @@ export class RTCIOStream {
         // dispatch onTrackChange explicitly for the user-driven case.
         this.mediaStream.addEventListener('addtrack', this.platformAddTrack);
         this.mediaStream.addEventListener('removetrack', this.platformRemoveTrack);
+    }
+    /**
+     * Read-only view of the current options. Use `setEncoding()` to update
+     * encoding fields at runtime.
+     */
+    get options() {
+        return this._options;
+    }
+    /** @internal Library accessor for the codec-preference callback. */
+    _getCodecPreferences() {
+        return this._options.codecPreferences;
+    }
+    /** @internal Library accessor for the current encoding config. */
+    _getVideoEncoding() {
+        return this._options.videoEncoding;
+    }
+    /**
+     * @internal Called by the Socket when it creates an `RTCRtpSender` for
+     * this stream on a peer. Tracks the sender so `setEncoding()` can re-apply
+     * params without renegotiation.
+     */
+    _registerSender(peerId, sender) {
+        let set = this._trackedSenders.get(peerId);
+        if (!set) {
+            set = new Set();
+            this._trackedSenders.set(peerId, set);
+        }
+        set.add(sender);
+    }
+    /** @internal Called by the Socket on peer cleanup. */
+    _unregisterPeer(peerId) {
+        this._trackedSenders.delete(peerId);
+    }
+    applyContentHintToAll() {
+        this.mediaStream.getVideoTracks().forEach(this.applyContentHintTo);
     }
     onTrackChanged(callback) {
         this.trackChangeCallbacks.push(callback);
@@ -80,6 +139,7 @@ export class RTCIOStream {
         };
     }
     addTrack(track) {
+        this.applyContentHintTo(track);
         this.mediaStream.addTrack(track);
         this.onTrackChange();
         return this;
@@ -100,6 +160,7 @@ export class RTCIOStream {
         const old = (_a = this.mediaStream.getTracks().find(t => t.kind === newTrack.kind)) !== null && _a !== void 0 ? _a : null;
         if (old)
             this.mediaStream.removeTrack(old);
+        this.applyContentHintTo(newTrack);
         this.mediaStream.addTrack(newTrack);
         this.onTrackChange();
         return old;
@@ -107,8 +168,43 @@ export class RTCIOStream {
     replace(stream) {
         const oldTracks = [...this.mediaStream.getTracks()];
         oldTracks.forEach(track => this.mediaStream.removeTrack(track));
-        stream.getTracks().forEach(track => this.mediaStream.addTrack(track));
+        stream.getTracks().forEach(track => {
+            this.applyContentHintTo(track);
+            this.mediaStream.addTrack(track);
+        });
         this.onTrackChange();
+    }
+    /**
+     * Update sender-side encoding parameters at runtime, across every peer
+     * currently receiving this stream. Merges `partial` over the current
+     * config and re-applies to all tracked `RTCRtpSender`s without
+     * renegotiation.
+     *
+     * Use this to react to network conditions (downshift bitrate when the app
+     * sees congestion alerts), to flip `degradationPreference` mid-call, or
+     * to update `contentHint` when content type changes (e.g. user switches
+     * from sharing slides to sharing gameplay).
+     *
+     * Codec preferences are **not** updatable here — changing codecs requires
+     * renegotiation and is out of scope for runtime tuning.
+     *
+     * @returns A promise that resolves once `setParameters` has been called
+     *          on every tracked sender. Individual sender failures are
+     *          swallowed (they typically mean the peer just disconnected).
+     */
+    async setEncoding(partial) {
+        this._options = Object.assign(Object.assign({}, this._options), { videoEncoding: Object.assign(Object.assign({}, this._options.videoEncoding), partial) });
+        if (partial.contentHint !== undefined) {
+            this.applyContentHintToAll();
+        }
+        const cfg = this._options.videoEncoding;
+        const promises = [];
+        this._trackedSenders.forEach((set) => {
+            set.forEach((sender) => {
+                promises.push(applyVideoEncodingToSender(sender, cfg).catch(() => undefined));
+            });
+        });
+        await Promise.all(promises);
     }
     /**
      * Detaches the platform-track-event listeners and drops user-registered
@@ -126,4 +222,42 @@ export class RTCIOStream {
     toJSON() {
         return `[RTCIOStream] ${this.id}`;
     }
+}
+/**
+ * Applies a {@link VideoEncodingConfig} to a single `RTCRtpSender`. Exported
+ * for use by the library; user code should call `RTCIOStream.setEncoding`
+ * instead.
+ *
+ * Skips senders whose track is not video — encoding params on audio senders
+ * are valid in the spec but the config is shaped around video tuning.
+ *
+ * @internal
+ */
+export async function applyVideoEncodingToSender(sender, cfg) {
+    if (sender.track && sender.track.kind !== 'video')
+        return;
+    const params = sender.getParameters();
+    if (cfg.degradationPreference !== undefined) {
+        params.degradationPreference = cfg.degradationPreference;
+    }
+    // `getParameters()` may return `encodings: undefined` on a freshly created
+    // sender in some browser/state combos — give it a one-entry default so we
+    // have somewhere to write.
+    if (!params.encodings || params.encodings.length === 0) {
+        params.encodings = [{}];
+    }
+    for (const enc of params.encodings) {
+        if (cfg.maxBitrate !== undefined)
+            enc.maxBitrate = cfg.maxBitrate;
+        if (cfg.maxFramerate !== undefined)
+            enc.maxFramerate = cfg.maxFramerate;
+        if (cfg.priority !== undefined)
+            enc.priority = cfg.priority;
+        if (cfg.networkPriority !== undefined)
+            enc.networkPriority = cfg.networkPriority;
+        if (cfg.scaleResolutionDownBy !== undefined) {
+            enc.scaleResolutionDownBy = cfg.scaleResolutionDownBy;
+        }
+    }
+    await sender.setParameters(params);
 }

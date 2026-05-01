@@ -30,4 +30,5 @@ export { protocol } from "socket.io-parser";
  */
 export { RtcioEvents } from "./lib/events";
 export type { ChannelOptions } from "./lib/channel";
+export type { VideoEncodingConfig, CodecPreferenceCallback, RTCIOStreamOptions, } from "./lib/stream";
 export { RTCIOStream, RTCIOChannel, RTCIOBroadcastChannel, Manager, Socket, lookup as io, lookup as connect, lookup as default, };

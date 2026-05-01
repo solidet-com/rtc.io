@@ -253,6 +253,68 @@ oldAudio?.stop();
 
 The library calls `RTCRtpSender.replaceTrack` on every peer — no SDP renegotiation, no audible glitch. Do **not** stop tracks on the original `MediaStream` and add new ones manually if you can avoid it; you'll trigger renegotiation rounds.
 
+### 9. Tune `RTCIOStream` for high-motion / game streaming
+
+`RTCIOStream(mediaStream, options?)` accepts `videoEncoding` and `codecPreferences`. Defaults are the browser's defaults — fine for talking-head video, **wrong for high-motion content** (games, sports, screen-share of moving content). Default WebRTC `degradationPreference` is `'balanced'`, which sheds FPS first under bandwidth pressure — the opposite of what game streams want.
+
+```ts
+const display = await navigator.mediaDevices.getDisplayMedia({
+  video: { frameRate: { ideal: 60, min: 30 }, width: 1920, height: 1080 },
+  audio: true,
+});
+
+const game = new RTCIOStream(display, {
+  videoEncoding: {
+    contentHint: "motion",                       // applied to every video track
+    maxBitrate: 8_000_000,                       // ~70-80% of measured uplink
+    maxFramerate: 60,
+    degradationPreference: "maintain-framerate", // drop resolution before FPS
+    priority: "high",
+    networkPriority: "high",
+  },
+  codecPreferences: (caps, kind) => {
+    if (kind !== "video") return caps;
+    const order = ["video/VP9", "video/AV1", "video/VP8", "video/H264"];
+    return order.flatMap(m => caps.filter(c => c.mimeType.toLowerCase() === m.toLowerCase()));
+  },
+});
+
+socket.emit("game", game);
+```
+
+The library applies the config to **every peer** — already-connected and late joiners — at transceiver creation. Codec preferences run synchronously before the SDP offer (must, since they affect m-line ordering); encoding params run async after `addTransceiver` (don't affect SDP).
+
+Runtime updates without renegotiation:
+
+```ts
+// Bandwidth alert — halve the ceiling on every peer.
+await game.setEncoding({ maxBitrate: 4_000_000 });
+
+// Content-type changed (gameplay → menu / stats overlay).
+await game.setEncoding({ contentHint: "detail", degradationPreference: "maintain-resolution" });
+```
+
+`setEncoding` re-calls `RTCRtpSender.setParameters` on every tracked sender. **Codec changes are not supported at runtime** — they require renegotiation; build a new `RTCIOStream` and re-emit if you really need to switch codecs mid-call.
+
+Verification recipe (do this once when tuning a deployment):
+
+```ts
+setInterval(async () => {
+  const stats = await socket.getPeer(peerId).connection.getStats();
+  stats.forEach(r => {
+    if (r.type === "outbound-rtp" && r.kind === "video") {
+      console.log({
+        fps: r.framesPerSecond,
+        bitrate: r.targetBitrate,
+        limited: r.qualityLimitationReason,  // 'bandwidth' | 'cpu' | 'other' | 'none'
+      });
+    }
+  });
+}, 1000);
+```
+
+`qualityLimitationReason` is the diagnostic: `'bandwidth'` means raise `maxBitrate` or accept the cap; `'cpu'` means drop resolution, switch codec, or enable hardware encode; `'none'` means you're done.
+
 ---
 
 ## Anti-patterns to avoid
@@ -267,6 +329,8 @@ The library calls `RTCRtpSender.replaceTrack` on every peer — no SDP renegotia
 | Sending a `File` directly via `socket.emit` | Files JSON-serialise to `{}` | Read into `ArrayBuffer` chunks and send via `createChannel(name).send(buf)` |
 | Manually building offers/answers/candidates | The library does this | Use `socket.emit` / `socket.peer(id).emit` |
 | Forgetting `socket.off` on cleanup | Listener leak across re-mounts | Pair every `on` with an `off` |
+| Reaching for `getPeer(id).connection.getSenders()` to call `setParameters` | Bypasses the per-stream registry; doesn't reapply on late joiners or replaced tracks | Pass `videoEncoding` to `new RTCIOStream(media, opts)` and use `stream.setEncoding(partial)` |
+| Using `getDisplayMedia()` defaults for game streaming | Conservative FPS/resolution defaults plus `degradationPreference: 'balanced'` collapse FPS on high motion | Set explicit `frameRate`/`width`/`height` and pass `videoEncoding: { contentHint: 'motion', degradationPreference: 'maintain-framerate', maxBitrate: ... }` |
 
 ---
 
@@ -379,6 +443,9 @@ socket.untrackStream(screen);
 socket.emit("screen-stopped");
 ```
 
+**Q: How do I stream a game / high-motion content without FPS collapsing?**
+Pass `videoEncoding` to `RTCIOStream`. The four levers, in order of impact: `degradationPreference: 'maintain-framerate'`, `contentHint: 'motion'`, raise `maxBitrate` to ~70-80% of uplink, prefer VP9/AV1 via `codecPreferences`. Full example in pattern #9 above. Use `stream.setEncoding(partial)` to react to network conditions at runtime (no renegotiation). Do **not** mid-call switch codecs — that needs renegotiation; build a fresh stream and re-emit.
+
 **Q: How do I detect a new peer?**
 `socket.on('peer-connect', ({ id }) => ...)`. Don't use the socket.io `connect` event — that fires when the socket reaches the server, not when a peer is reachable.
 
@@ -408,7 +475,7 @@ When generating code that uses rtc.io:
 1. **TypeScript first.** Type peer ids as `string`, channel names as string literals where possible.
 2. **No try/catch around `socket.emit`.** It does not throw on user error; it logs and drops. If you need delivery confirmation, the receiver should ack with `socket.peer(senderId).emit('ack', ...)`.
 3. **No manual ack callbacks.** socket.io's ack callback (`emit('ev', data, cb)`) is silently dropped by `rtc.io` because DataChannels have no ack channel. The library logs a warning. Build acks at the application layer.
-4. **Don't shim `RTCPeerConnection`.** If you need access for advanced stats, use `socket.getPeer(peerId).connection`, but treat it as read-only. Mutating its transceivers will fight the library.
+4. **Don't shim `RTCPeerConnection`.** If you need access for advanced stats, use `socket.getPeer(peerId).connection`, but treat it as read-only. Mutating its transceivers will fight the library. For sender encoding (bitrate, FPS, codec), pass `videoEncoding` / `codecPreferences` to `new RTCIOStream(media, opts)` and use `stream.setEncoding(partial)` for runtime updates — these are applied to every peer including late joiners.
 5. **Server-side: socket.io idioms apply.** `rtc.io-server` extends `socket.io` — `socket.join(room)`, `io.to(room).emit(...)`, `socket.data.x = y`, all work as you'd expect.
 
 ---

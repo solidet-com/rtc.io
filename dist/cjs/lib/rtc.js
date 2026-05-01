@@ -128,6 +128,13 @@ class Socket extends socket_io_client_1.Socket {
                             t.direction = 'sendonly';
                         if (t.sender.setStreams)
                             t.sender.setStreams(rtcioStream.mediaStream);
+                        // replaceTrack reuses the same sender — no need to re-apply codec
+                        // preferences (which only affect SDP), but the encoding config may
+                        // need re-asserting if the new track has different defaults.
+                        const encoding = rtcioStream._getVideoEncoding();
+                        if (encoding && replacement.kind === 'video') {
+                            (0, stream_1.applyVideoEncodingToSender)(t.sender, encoding).catch(() => undefined);
+                        }
                         claimed.add(replacement.id);
                     }
                     else if (senderTrack) {
@@ -144,6 +151,7 @@ class Socket extends socket_io_client_1.Socket {
                         streams: [rtcioStream.mediaStream],
                     });
                     peer.streamTransceivers[streamMsId].push(transceiver);
+                    this.wireTransceiverForStream(peer, rtcioStream, transceiver, track);
                     claimed.add(track.id);
                 });
             });
@@ -172,6 +180,7 @@ class Socket extends socket_io_client_1.Socket {
                             idle.sender.setStreams(rtcioStream.mediaStream);
                         }
                         peer.streamTransceivers[streamMsId].push(idle);
+                        this.wireTransceiverForStream(peer, rtcioStream, idle, track);
                         this.log('debug', 'Reused idle transceiver', { kind: track.kind, peer: peer.socketId });
                     }
                     else {
@@ -180,6 +189,7 @@ class Socket extends socket_io_client_1.Socket {
                             streams: [rtcioStream.mediaStream],
                         });
                         peer.streamTransceivers[streamMsId].push(transceiver);
+                        this.wireTransceiverForStream(peer, rtcioStream, transceiver, track);
                     }
                 }
             });
@@ -888,6 +898,57 @@ class Socket extends socket_io_client_1.Socket {
         }
         return data;
     }
+    /**
+     * Apply user-configured codec preferences to a transceiver. Must be called
+     * synchronously after `addTransceiver` (and before the next SDP offer)
+     * because `setCodecPreferences` reorders/filters the codec list that goes
+     * into the m-line. No-op if the stream has no `codecPreferences`
+     * callback, the browser doesn't support the API, or the callback returns
+     * an empty list (treated as "leave the default order alone").
+     */
+    applyCodecPreferences(transceiver, track, cb) {
+        var _a, _b;
+        if (typeof transceiver.setCodecPreferences !== 'function')
+            return;
+        const kind = track.kind === 'audio' ? 'audio' : 'video';
+        const caps = (_b = (_a = RTCRtpSender).getCapabilities) === null || _b === void 0 ? void 0 : _b.call(_a, kind);
+        const codecs = caps === null || caps === void 0 ? void 0 : caps.codecs;
+        if (!codecs || codecs.length === 0)
+            return;
+        try {
+            const ordered = cb(codecs.slice(), kind);
+            if (!ordered || ordered.length === 0)
+                return;
+            transceiver.setCodecPreferences(ordered);
+        }
+        catch (err) {
+            this.log('warn', 'codecPreferences callback / setCodecPreferences failed', { err });
+        }
+    }
+    /**
+     * Wire a transceiver that we've just associated with `rtcioStream`:
+     *
+     *   - Apply codec preferences (must run before negotiation).
+     *   - Apply video encoding params (`maxBitrate`, `degradationPreference`,
+     *     etc.) — async; fired-and-forgotten because it doesn't affect SDP.
+     *   - Register the sender with the stream so `setEncoding()` can re-apply
+     *     params at runtime, and unregistration on peer cleanup keeps the
+     *     registry from leaking dead senders.
+     */
+    wireTransceiverForStream(peer, rtcioStream, transceiver, track) {
+        const codecCb = rtcioStream._getCodecPreferences();
+        if (codecCb)
+            this.applyCodecPreferences(transceiver, track, codecCb);
+        rtcioStream._registerSender(peer.socketId, transceiver.sender);
+        const encoding = rtcioStream._getVideoEncoding();
+        if (encoding && track.kind === 'video') {
+            (0, stream_1.applyVideoEncodingToSender)(transceiver.sender, encoding).catch((err) => {
+                this.log('warn', 'applyVideoEncodingToSender failed', {
+                    peer: peer.socketId, err,
+                });
+            });
+        }
+    }
     // ─── Liveness watchdog ──────────────────────────────────────────────────
     /**
      * Armed when a peer's connectionState becomes 'disconnected' or 'failed'.
@@ -944,6 +1005,7 @@ class Socket extends socket_io_client_1.Socket {
         }
     }
     cleanupPeer(peerId) {
+        var _a;
         const peer = this.rtcpeers[peerId];
         if (!peer)
             return;
@@ -962,6 +1024,15 @@ class Socket extends socket_io_client_1.Socket {
         // pin the closed peer's MediaStream listeners. The MediaStream itself may
         // outlive the peer if the app handed it to a `<video>` element.
         Object.values(peer.streams).forEach((s) => { var _a; return (_a = s.dispose) === null || _a === void 0 ? void 0 : _a.call(s); });
+        // Drop sender registrations on every outbound stream so setEncoding()
+        // no longer calls into senders attached to a closed RTCPeerConnection.
+        // streamEvents is the authoritative outbound registry — peer.streams
+        // also includes inbound wrappers (from ontrack), so iterate the
+        // outbound side directly.
+        for (const key in this.streamEvents) {
+            const stream = this.getRTCIOStreamDeep(this.streamEvents[key]);
+            (_a = stream === null || stream === void 0 ? void 0 : stream._unregisterPeer) === null || _a === void 0 ? void 0 : _a.call(stream, peerId);
+        }
         // Notify all broadcast channels so they fire 'peer-left' and update their peer maps
         this._broadcastChannels.forEach((bch) => bch._removePeer(peerId));
         // Drop per-peer listener registry

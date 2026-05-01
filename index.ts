@@ -89,6 +89,12 @@ export { RtcioEvents } from "./lib/events";
 
 export type { ChannelOptions } from "./lib/channel";
 
+export type {
+	VideoEncodingConfig,
+	CodecPreferenceCallback,
+	RTCIOStreamOptions,
+} from "./lib/stream";
+
 export {
 	RTCIOStream,
 	RTCIOChannel,

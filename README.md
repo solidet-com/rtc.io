@@ -119,6 +119,52 @@ file.on("open", () => {
 
 Defaults work for most apps. Lower `highWatermark` for tighter memory caps; raise it for fat-pipe LAN bulk transfers. Keep `lowWatermark` below `highWatermark` — otherwise `'drain'` fires on every send and the throttling collapses. See [Backpressure & flow control](https://docs.rtcio.dev/docs/guides/backpressure) for the tuning guide.
 
+### Game streaming / high-motion video tuning
+
+Default WebRTC encoder settings are tuned for talking-head video. On high-motion content (game streams, sports, fast screen-share) the encoder runs out of bitrate, falls back to `degradationPreference: 'balanced'`, and starts shedding FPS — which is exactly the wrong tradeoff for games. `RTCIOStream` accepts a one-shot config to fix that:
+
+```ts
+const display = await navigator.mediaDevices.getDisplayMedia({
+  video: { frameRate: { ideal: 60, min: 30 }, width: 1920, height: 1080 },
+  audio: true,
+});
+
+const game = new RTCIOStream(display, {
+  videoEncoding: {
+    contentHint: "motion",                    // tell the encoder this is high-motion content
+    maxBitrate: 8_000_000,                    // 8 Mbps — set to ~70-80% of measured uplink
+    maxFramerate: 60,
+    degradationPreference: "maintain-framerate", // drop resolution before FPS under pressure
+    priority: "high",                         // intra-PC scheduling
+    networkPriority: "high",                  // DSCP marks where the network honours them
+  },
+  // Optional codec preference. VP9/AV1 cut bitrate ~30-50% vs VP8 at the same quality.
+  codecPreferences: (caps, kind) => {
+    if (kind !== "video") return caps;
+    const order = ["video/VP9", "video/AV1", "video/VP8", "video/H264"];
+    return order.flatMap(mime =>
+      caps.filter(c => c.mimeType.toLowerCase() === mime.toLowerCase())
+    );
+  },
+});
+
+socket.emit("game", game);
+```
+
+The config applies to every peer — already-connected and late joiners. To react to network conditions at runtime without renegotiation, call `setEncoding`:
+
+```ts
+// Bandwidth alert: halve bitrate on every peer.
+await game.setEncoding({ maxBitrate: 4_000_000 });
+
+// User toggles between gameplay (motion) and stats overlay (detail).
+await game.setEncoding({ contentHint: "detail", degradationPreference: "maintain-resolution" });
+```
+
+`setEncoding` calls [`RTCRtpSender.setParameters`](https://developer.mozilla.org/en-US/docs/Web/API/RTCRtpSender/setParameters) on every tracked sender — no offer/answer round trip. Codec preferences are not runtime-updatable (changing codecs requires renegotiation).
+
+To verify the tune is taking effect, poll [`getStats()`](https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/getStats) and watch `framesPerSecond`, `targetBitrate`, and `qualityLimitationReason` on the `outbound-rtp` report. `qualityLimitationReason: 'bandwidth'` means raise `maxBitrate` (or accept the cap); `'cpu'` means drop resolution, switch codec, or enable hardware encode.
+
 ## API surface
 
 | API | Use |
@@ -130,7 +176,8 @@ Defaults work for most apps. Lower `highWatermark` for tighter memory caps; rais
 | `socket.peer(id).createChannel(name, opts)` | Open a custom DataChannel to one peer |
 | `socket.createChannel(name, opts)` | Broadcast DataChannel — every peer (and late joiners) shares it |
 | `socket.server.emit/on` | Escape hatch to talk to the signaling server directly |
-| `RTCIOStream(mediaStream)` | Wrap a MediaStream so it can be `emit`-ed and replayed to late joiners |
+| `RTCIOStream(mediaStream, opts?)` | Wrap a MediaStream so it can be `emit`-ed and replayed to late joiners. `opts` accepts `videoEncoding` (maxBitrate, maxFramerate, degradationPreference, contentHint, priority, networkPriority, scaleResolutionDownBy) and `codecPreferences(caps, kind)` for codec selection |
+| `stream.setEncoding(partial)` | Update sender-side encoding params at runtime across every peer — no renegotiation |
 | `socket.untrackStream(stream)` | Stop replaying a stream to future peers (already-connected peers unaffected; signal them at app level) |
 | `socket.getStats(id)`, `getSessionStats(id)`, `getIceCandidateStats(id)` | Per-peer WebRTC stats |
 
