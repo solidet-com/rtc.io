@@ -153,16 +153,6 @@ export class RTCIOStream {
 	// setEncoding() runtime updates.
 	private _trackedSenders: Map<string, Set<RTCRtpSender>> = new Map();
 
-	// peerId → transceivers we created for this stream on that peer. Mirrors
-	// _trackedSenders but at the transceiver level so setCodecPreferences()
-	// can re-apply codec ordering without renegotiating the whole connection.
-	private _trackedTransceivers: Map<string, Set<RTCRtpTransceiver>> = new Map();
-
-	// peerId → callback that triggers a fresh offer cycle on that peer.
-	// Provided by the Socket on transceiver registration so the stream can
-	// kick off renegotiation after a live setCodecPreferences() change.
-	private _renegotiateCallbacks: Map<string, () => void> = new Map();
-
 	constructor(mediaStream: MediaStream, options?: RTCIOStreamOptions);
 	constructor(id: string, mediaStream: MediaStream, options?: RTCIOStreamOptions);
 	constructor(
@@ -224,54 +214,9 @@ export class RTCIOStream {
 		set.add(sender);
 	}
 
-	/**
-	 * @internal Called by the Socket alongside `_registerSender`. Tracks the
-	 * transceiver so `setCodecPreferences()` can re-order codecs on the
-	 * existing m-line, and stashes a per-peer callback the stream can invoke
-	 * to kick the offer cycle once the new preferences are in place.
-	 */
-	_registerTransceiver(
-		peerId: string,
-		transceiver: RTCRtpTransceiver,
-		renegotiate: () => void,
-	) {
-		let set = this._trackedTransceivers.get(peerId);
-		if (!set) {
-			set = new Set();
-			this._trackedTransceivers.set(peerId, set);
-		}
-		set.add(transceiver);
-		// Latest callback wins — they all close over the same peer entry, so
-		// any of them is correct. The map only needs one per peer.
-		this._renegotiateCallbacks.set(peerId, renegotiate);
-	}
-
 	/** @internal Called by the Socket on peer cleanup. */
 	_unregisterPeer(peerId: string) {
 		this._trackedSenders.delete(peerId);
-		this._trackedTransceivers.delete(peerId);
-		this._renegotiateCallbacks.delete(peerId);
-	}
-
-	/**
-	 * @internal Drop a single transceiver+sender from the per-peer registry.
-	 * Called by the Socket when a transceiver transitions to direction
-	 * `'inactive'` (its track was removed without a same-kind replacement).
-	 * Without this, `setCodecPreferences` would later iterate inactive
-	 * m-lines, and successive remove/add cycles would accumulate dead
-	 * transceivers in the set even though the platform reuses the slots.
-	 *
-	 * The renegotiate callback stays — it is keyed by peer, not transceiver,
-	 * and is still valid as long as any transceiver for this peer is live.
-	 * It's cleared in `_unregisterPeer` on full peer cleanup.
-	 */
-	_untrackTransceiver(peerId: string, transceiver: RTCRtpTransceiver) {
-		const tx = this._trackedTransceivers.get(peerId);
-		tx?.delete(transceiver);
-		if (tx && tx.size === 0) this._trackedTransceivers.delete(peerId);
-		const senders = this._trackedSenders.get(peerId);
-		senders?.delete(transceiver.sender);
-		if (senders && senders.size === 0) this._trackedSenders.delete(peerId);
 	}
 
 	private applyContentHintTo = (track: MediaStreamTrack) => {
@@ -423,84 +368,6 @@ export class RTCIOStream {
 			});
 		});
 		await Promise.all(promises);
-	}
-
-	/**
-	 * Re-order codecs on every peer currently receiving this stream and
-	 * trigger a single offer/answer round per peer to put the change on the
-	 * wire. The capture stream is **not** restarted — no track interruption,
-	 * no fresh `getDisplayMedia` prompt, no permission re-grant.
-	 *
-	 * Use this when the user picks a different codec mid-call (e.g. flips
-	 * VP9 → AV1 while screen-sharing). Encoder-side knobs (bitrate, FPS cap,
-	 * degradation, contentHint) belong on `setEncoding` — they don't need
-	 * renegotiation.
-	 *
-	 * Pass `undefined` to clear the preference and let the browser default
-	 * order apply on the next negotiation.
-	 *
-	 * @returns A promise that resolves once `setCodecPreferences` has been
-	 *          called on every tracked transceiver and per-peer offers have
-	 *          been kicked off. Awaiting it does **not** wait for the offers
-	 *          to complete — that's an out-of-band signaling round.
-	 */
-	async setCodecPreferences(cb: CodecPreferenceCallback | undefined): Promise<void> {
-		this._options = { ...this._options, codecPreferences: cb };
-
-		// Resolve sender capabilities once per kind — cheap, but every call
-		// hits a browser API so cache for the loop. `getCapabilities` is
-		// declared non-optional in lib.dom.d.ts, but absent on older browsers,
-		// so we cast through `any` (matching the rtc.ts call site) to make
-		// the optional-chain legal under strict TS.
-		const capsCache: Partial<Record<'audio' | 'video', RTCRtpCodec[]>> = {};
-		const capsFor = (kind: 'audio' | 'video'): RTCRtpCodec[] | undefined => {
-			if (kind in capsCache) return capsCache[kind];
-			const c = (RTCRtpSender as any).getCapabilities?.(kind);
-			capsCache[kind] = c?.codecs ?? undefined;
-			return capsCache[kind];
-		};
-
-		this._trackedTransceivers.forEach((set, peerId) => {
-			let touched = false;
-			set.forEach((transceiver) => {
-				if (typeof transceiver.setCodecPreferences !== 'function') return;
-				// Skip transceivers that won't carry media in the next offer:
-				//   - 'stopped' / 'closed' transceivers (terminal states)
-				//   - 'inactive' direction (codec list ignored on inactive m-lines)
-				// They should normally be untracked already, but defending here
-				// keeps a stale entry from causing a wasted call or surfacing a
-				// browser-thrown InvalidStateError on `setCodecPreferences`.
-				if (transceiver.currentDirection === 'stopped') return;
-				if (transceiver.direction === 'inactive' || transceiver.direction === 'stopped') return;
-				const trackKind = transceiver.sender.track?.kind ?? transceiver.receiver.track?.kind;
-				const kind: 'audio' | 'video' = trackKind === 'audio' ? 'audio' : 'video';
-				const codecs = capsFor(kind);
-				if (!codecs || codecs.length === 0) return;
-				try {
-					if (cb) {
-						const ordered = cb(codecs.slice(), kind);
-						if (ordered && ordered.length > 0) {
-							transceiver.setCodecPreferences(ordered);
-							touched = true;
-						}
-					} else {
-						// Clearing: spec says passing [] resets to the default order.
-						transceiver.setCodecPreferences([]);
-						touched = true;
-					}
-				} catch {
-					// Browser refused this ordering — leave the previous one in place.
-				}
-			});
-			// Skip the renegotiation if no transceiver actually accepted a
-			// new ordering — a wasted offer/answer round on the wire would
-			// just re-encode the same codec choice.
-			if (!touched) return;
-			const trigger = this._renegotiateCallbacks.get(peerId);
-			if (trigger) {
-				try { trigger(); } catch { /* swallow — peer may be tearing down */ }
-			}
-		});
 	}
 
 	/**

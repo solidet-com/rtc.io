@@ -161,23 +161,7 @@ await game.setEncoding({ maxBitrate: 4_000_000 });
 await game.setEncoding({ contentHint: "detail", degradationPreference: "maintain-resolution" });
 ```
 
-`setEncoding` calls [`RTCRtpSender.setParameters`](https://developer.mozilla.org/en-US/docs/Web/API/RTCRtpSender/setParameters) on every tracked sender — no offer/answer round trip.
-
-To swap codecs mid-stream without tearing the capture down (no fresh `getDisplayMedia` prompt, the user keeps their picked window/screen/tab), call `setCodecPreferences`:
-
-```ts
-// Switch the active screen-share / game stream to AV1, fall back through VP9.
-await game.setCodecPreferences((caps, kind) => {
-  if (kind !== "video") return caps;
-  const order = ["video/AV1", "video/VP9", "video/VP8", "video/H264"];
-  return order.flatMap(m => caps.filter(c => c.mimeType.toLowerCase() === m.toLowerCase()));
-});
-
-// Reset to the browser's default order.
-await game.setCodecPreferences(undefined);
-```
-
-The library re-applies the codec list on every tracked transceiver and triggers exactly one offer/answer round per peer — peers see at most a keyframe glitch as the encoder swaps. Capture stream and senders survive the swap.
+`setEncoding` calls [`RTCRtpSender.setParameters`](https://developer.mozilla.org/en-US/docs/Web/API/RTCRtpSender/setParameters) on every tracked sender — no offer/answer round trip. Codec preferences are not runtime-updatable (changing codecs requires renegotiation).
 
 To verify the tune is taking effect, poll [`getStats()`](https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/getStats) and watch `framesPerSecond`, `targetBitrate`, and `qualityLimitationReason` on the `outbound-rtp` report. `qualityLimitationReason: 'bandwidth'` means raise `maxBitrate` (or accept the cap); `'cpu'` means drop resolution, switch codec, or enable hardware encode.
 
@@ -194,8 +178,6 @@ To verify the tune is taking effect, poll [`getStats()`](https://developer.mozil
 | `socket.server.emit/on` | Escape hatch to talk to the signaling server directly |
 | `RTCIOStream(mediaStream, opts?)` | Wrap a MediaStream so it can be `emit`-ed and replayed to late joiners. `opts` accepts `videoEncoding` (maxBitrate, maxFramerate, degradationPreference, contentHint, priority, networkPriority, scaleResolutionDownBy) and `codecPreferences(caps, kind)` for codec selection |
 | `stream.setEncoding(partial)` | Update sender-side encoding params at runtime across every peer — no renegotiation |
-| `stream.setCodecPreferences(cb)` | Swap codec ordering mid-stream — re-applies on every tracked transceiver and triggers one offer/answer round per peer; capture stream survives |
-| `stream.replaceTrack(track)` | Hot-swap a same-kind track (mic/cam picker, mute → unmute reacquire) via `RTCRtpSender.replaceTrack` on every peer — no SDP renegotiation |
 | `socket.untrackStream(stream)` | Stop replaying a stream to future peers (already-connected peers unaffected; signal them at app level) |
 | `socket.getStats(id)`, `getSessionStats(id)`, `getIceCandidateStats(id)` | Per-peer WebRTC stats |
 

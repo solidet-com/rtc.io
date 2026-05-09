@@ -120,8 +120,6 @@ export declare class RTCIOStream {
     private removeTrackCallbacks;
     private _options;
     private _trackedSenders;
-    private _trackedTransceivers;
-    private _renegotiateCallbacks;
     constructor(mediaStream: MediaStream, options?: RTCIOStreamOptions);
     constructor(id: string, mediaStream: MediaStream, options?: RTCIOStreamOptions);
     /**
@@ -139,28 +137,8 @@ export declare class RTCIOStream {
      * params without renegotiation.
      */
     _registerSender(peerId: string, sender: RTCRtpSender): void;
-    /**
-     * @internal Called by the Socket alongside `_registerSender`. Tracks the
-     * transceiver so `setCodecPreferences()` can re-order codecs on the
-     * existing m-line, and stashes a per-peer callback the stream can invoke
-     * to kick the offer cycle once the new preferences are in place.
-     */
-    _registerTransceiver(peerId: string, transceiver: RTCRtpTransceiver, renegotiate: () => void): void;
     /** @internal Called by the Socket on peer cleanup. */
     _unregisterPeer(peerId: string): void;
-    /**
-     * @internal Drop a single transceiver+sender from the per-peer registry.
-     * Called by the Socket when a transceiver transitions to direction
-     * `'inactive'` (its track was removed without a same-kind replacement).
-     * Without this, `setCodecPreferences` would later iterate inactive
-     * m-lines, and successive remove/add cycles would accumulate dead
-     * transceivers in the set even though the platform reuses the slots.
-     *
-     * The renegotiate callback stays — it is keyed by peer, not transceiver,
-     * and is still valid as long as any transceiver for this peer is live.
-     * It's cleared in `_unregisterPeer` on full peer cleanup.
-     */
-    _untrackTransceiver(peerId: string, transceiver: RTCRtpTransceiver): void;
     private applyContentHintTo;
     private applyContentHintToAll;
     private platformAddTrack;
@@ -215,26 +193,6 @@ export declare class RTCIOStream {
      *          swallowed (they typically mean the peer just disconnected).
      */
     setEncoding(partial: Partial<VideoEncodingConfig>): Promise<void>;
-    /**
-     * Re-order codecs on every peer currently receiving this stream and
-     * trigger a single offer/answer round per peer to put the change on the
-     * wire. The capture stream is **not** restarted — no track interruption,
-     * no fresh `getDisplayMedia` prompt, no permission re-grant.
-     *
-     * Use this when the user picks a different codec mid-call (e.g. flips
-     * VP9 → AV1 while screen-sharing). Encoder-side knobs (bitrate, FPS cap,
-     * degradation, contentHint) belong on `setEncoding` — they don't need
-     * renegotiation.
-     *
-     * Pass `undefined` to clear the preference and let the browser default
-     * order apply on the next negotiation.
-     *
-     * @returns A promise that resolves once `setCodecPreferences` has been
-     *          called on every tracked transceiver and per-peer offers have
-     *          been kicked off. Awaiting it does **not** wait for the offers
-     *          to complete — that's an out-of-band signaling round.
-     */
-    setCodecPreferences(cb: CodecPreferenceCallback | undefined): Promise<void>;
     /**
      * Detaches the platform-track-event listeners and drops user-registered
      * callbacks. Call when you're done with the wrapper but the underlying
