@@ -211,6 +211,35 @@ export declare class Socket extends RootSocket {
         polite: boolean;
     }) => RTCPeer;
     /**
+     * Coalesced offer/answer driver. Set `peer.connectionStatus.negotiationNeeded`
+     * before invoking — the loop drains the flag, so back-to-back triggers in
+     * the same tick collapse into a single offer round.
+     *
+     * Used by both `onnegotiationneeded` (the platform's own signal) and the
+     * synthetic path in `_triggerRenegotiation` (called from
+     * `RTCIOStream.setCodecPreferences`). The two callers want identical
+     * semantics — extracting the loop keeps them from drifting apart.
+     *
+     * Re-checks `rtcpeers[peerId]` inside the loop because the manual path
+     * runs across an `await Promise.resolve()` and `cleanupPeer` may fire
+     * during that window (watchdog timeout, unhealthy `connectionState`,
+     * server-side peer-left hint corroborated). Calling `setLocalDescription`
+     * on a closed connection throws an `InvalidStateError` we'd otherwise
+     * have to filter from the error log.
+     */
+    private _runOfferLoop;
+    /**
+     * Synthetic renegotiation trigger. The browser's `onnegotiationneeded`
+     * does **not** fire for `RTCRtpTransceiver.setCodecPreferences` changes
+     * — codec preferences only take effect on the next offer/answer pair, so
+     * something has to kick the cycle. This is that something.
+     *
+     * Takes a `peerId` (rather than a captured `RTCPeer`) so a stream's
+     * renegotiate callback that survives peer cleanup can no-op cleanly
+     * instead of operating on a stale peer reference.
+     */
+    private _triggerRenegotiation;
+    /**
      * Armed when a peer's connectionState becomes 'disconnected' or 'failed'.
      * If the peer hasn't returned to 'connected' by the time the timer fires,
      * the connection is force-closed and `peer-disconnect` is emitted via

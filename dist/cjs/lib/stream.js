@@ -22,6 +22,14 @@ class RTCIOStream {
         // the library at addTransceiver time; cleared on peer cleanup. Drives
         // setEncoding() runtime updates.
         this._trackedSenders = new Map();
+        // peerId → transceivers we created for this stream on that peer. Mirrors
+        // _trackedSenders but at the transceiver level so setCodecPreferences()
+        // can re-apply codec ordering without renegotiating the whole connection.
+        this._trackedTransceivers = new Map();
+        // peerId → callback that triggers a fresh offer cycle on that peer.
+        // Provided by the Socket on transceiver registration so the stream can
+        // kick off renegotiation after a live setCodecPreferences() change.
+        this._renegotiateCallbacks = new Map();
         this.applyContentHintTo = (track) => {
             var _a;
             if (track.kind !== 'video')
@@ -100,9 +108,50 @@ class RTCIOStream {
         }
         set.add(sender);
     }
+    /**
+     * @internal Called by the Socket alongside `_registerSender`. Tracks the
+     * transceiver so `setCodecPreferences()` can re-order codecs on the
+     * existing m-line, and stashes a per-peer callback the stream can invoke
+     * to kick the offer cycle once the new preferences are in place.
+     */
+    _registerTransceiver(peerId, transceiver, renegotiate) {
+        let set = this._trackedTransceivers.get(peerId);
+        if (!set) {
+            set = new Set();
+            this._trackedTransceivers.set(peerId, set);
+        }
+        set.add(transceiver);
+        // Latest callback wins — they all close over the same peer entry, so
+        // any of them is correct. The map only needs one per peer.
+        this._renegotiateCallbacks.set(peerId, renegotiate);
+    }
     /** @internal Called by the Socket on peer cleanup. */
     _unregisterPeer(peerId) {
         this._trackedSenders.delete(peerId);
+        this._trackedTransceivers.delete(peerId);
+        this._renegotiateCallbacks.delete(peerId);
+    }
+    /**
+     * @internal Drop a single transceiver+sender from the per-peer registry.
+     * Called by the Socket when a transceiver transitions to direction
+     * `'inactive'` (its track was removed without a same-kind replacement).
+     * Without this, `setCodecPreferences` would later iterate inactive
+     * m-lines, and successive remove/add cycles would accumulate dead
+     * transceivers in the set even though the platform reuses the slots.
+     *
+     * The renegotiate callback stays — it is keyed by peer, not transceiver,
+     * and is still valid as long as any transceiver for this peer is live.
+     * It's cleared in `_unregisterPeer` on full peer cleanup.
+     */
+    _untrackTransceiver(peerId, transceiver) {
+        const tx = this._trackedTransceivers.get(peerId);
+        tx === null || tx === void 0 ? void 0 : tx.delete(transceiver);
+        if (tx && tx.size === 0)
+            this._trackedTransceivers.delete(peerId);
+        const senders = this._trackedSenders.get(peerId);
+        senders === null || senders === void 0 ? void 0 : senders.delete(transceiver.sender);
+        if (senders && senders.size === 0)
+            this._trackedSenders.delete(peerId);
     }
     applyContentHintToAll() {
         this.mediaStream.getVideoTracks().forEach(this.applyContentHintTo);
@@ -209,6 +258,94 @@ class RTCIOStream {
             });
         });
         await Promise.all(promises);
+    }
+    /**
+     * Re-order codecs on every peer currently receiving this stream and
+     * trigger a single offer/answer round per peer to put the change on the
+     * wire. The capture stream is **not** restarted — no track interruption,
+     * no fresh `getDisplayMedia` prompt, no permission re-grant.
+     *
+     * Use this when the user picks a different codec mid-call (e.g. flips
+     * VP9 → AV1 while screen-sharing). Encoder-side knobs (bitrate, FPS cap,
+     * degradation, contentHint) belong on `setEncoding` — they don't need
+     * renegotiation.
+     *
+     * Pass `undefined` to clear the preference and let the browser default
+     * order apply on the next negotiation.
+     *
+     * @returns A promise that resolves once `setCodecPreferences` has been
+     *          called on every tracked transceiver and per-peer offers have
+     *          been kicked off. Awaiting it does **not** wait for the offers
+     *          to complete — that's an out-of-band signaling round.
+     */
+    async setCodecPreferences(cb) {
+        this._options = Object.assign(Object.assign({}, this._options), { codecPreferences: cb });
+        // Resolve sender capabilities once per kind — cheap, but every call
+        // hits a browser API so cache for the loop. `getCapabilities` is
+        // declared non-optional in lib.dom.d.ts, but absent on older browsers,
+        // so we cast through `any` (matching the rtc.ts call site) to make
+        // the optional-chain legal under strict TS.
+        const capsCache = {};
+        const capsFor = (kind) => {
+            var _a, _b, _c;
+            if (kind in capsCache)
+                return capsCache[kind];
+            const c = (_b = (_a = RTCRtpSender).getCapabilities) === null || _b === void 0 ? void 0 : _b.call(_a, kind);
+            capsCache[kind] = (_c = c === null || c === void 0 ? void 0 : c.codecs) !== null && _c !== void 0 ? _c : undefined;
+            return capsCache[kind];
+        };
+        this._trackedTransceivers.forEach((set, peerId) => {
+            let touched = false;
+            set.forEach((transceiver) => {
+                var _a, _b, _c;
+                if (typeof transceiver.setCodecPreferences !== 'function')
+                    return;
+                // Skip transceivers that won't carry media in the next offer:
+                //   - 'stopped' / 'closed' transceivers (terminal states)
+                //   - 'inactive' direction (codec list ignored on inactive m-lines)
+                // They should normally be untracked already, but defending here
+                // keeps a stale entry from causing a wasted call or surfacing a
+                // browser-thrown InvalidStateError on `setCodecPreferences`.
+                if (transceiver.currentDirection === 'stopped')
+                    return;
+                if (transceiver.direction === 'inactive' || transceiver.direction === 'stopped')
+                    return;
+                const trackKind = (_b = (_a = transceiver.sender.track) === null || _a === void 0 ? void 0 : _a.kind) !== null && _b !== void 0 ? _b : (_c = transceiver.receiver.track) === null || _c === void 0 ? void 0 : _c.kind;
+                const kind = trackKind === 'audio' ? 'audio' : 'video';
+                const codecs = capsFor(kind);
+                if (!codecs || codecs.length === 0)
+                    return;
+                try {
+                    if (cb) {
+                        const ordered = cb(codecs.slice(), kind);
+                        if (ordered && ordered.length > 0) {
+                            transceiver.setCodecPreferences(ordered);
+                            touched = true;
+                        }
+                    }
+                    else {
+                        // Clearing: spec says passing [] resets to the default order.
+                        transceiver.setCodecPreferences([]);
+                        touched = true;
+                    }
+                }
+                catch (_d) {
+                    // Browser refused this ordering — leave the previous one in place.
+                }
+            });
+            // Skip the renegotiation if no transceiver actually accepted a
+            // new ordering — a wasted offer/answer round on the wire would
+            // just re-encode the same codec choice.
+            if (!touched)
+                return;
+            const trigger = this._renegotiateCallbacks.get(peerId);
+            if (trigger) {
+                try {
+                    trigger();
+                }
+                catch ( /* swallow — peer may be tearing down */_a) { /* swallow — peer may be tearing down */ }
+            }
+        });
     }
     /**
      * Detaches the platform-track-event listeners and drops user-registered

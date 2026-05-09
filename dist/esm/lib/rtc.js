@@ -111,7 +111,10 @@ export class Socket extends RootSocket {
                 //   - If a same-kind replacement exists in the stream, hot-swap via
                 //     replaceTrack (no renegotiation).
                 //   - Otherwise mark the transceiver inactive (renegotiates) so the
-                //     remote stops expecting media on this m-line.
+                //     remote stops expecting media on this m-line, AND drop it
+                //     from the stream's tracked-transceiver registry — keeping
+                //     dead transceivers in the set would have `setCodecPreferences`
+                //     fanning work to inactive m-lines that ignore it anyway.
                 ownTransceivers.forEach(t => {
                     var _a, _b;
                     const senderTrack = t.sender.track;
@@ -137,19 +140,52 @@ export class Socket extends RootSocket {
                     else if (senderTrack) {
                         t.sender.replaceTrack(null);
                         t.direction = 'inactive';
+                        rtcioStream._untrackTransceiver(peer.socketId, t);
                     }
                 });
                 // Pass 3: brand-new tracks of a kind we don't have a transceiver for.
+                //
+                // Mirrors the idle-reuse logic in `addTransceiverToPeer`: if pass 2
+                // left an inactive transceiver of the same kind on the connection
+                // (or the connection has any other unclaimed idle slot), prefer
+                // reusing it over `addTransceiver`. Without this, a remove + add
+                // cycle of the same kind grows the m-line list every iteration.
+                const claimedTransceiverIds = new Set(Object.values(peer.streamTransceivers).flat().map(t => t.mid));
                 tracks.forEach(track => {
                     if (claimed.has(track.id))
                         return;
-                    const transceiver = peer.connection.addTransceiver(track, {
-                        direction: 'sendonly',
-                        streams: [rtcioStream.mediaStream],
+                    const idle = peer.connection.getTransceivers().find(t => {
+                        var _a;
+                        return t.sender.track === null
+                            && ((_a = t.receiver.track) === null || _a === void 0 ? void 0 : _a.kind) === track.kind
+                            && (t.direction === 'sendonly' || t.direction === 'sendrecv' || t.direction === 'inactive')
+                            && (t.mid == null || !claimedTransceiverIds.has(t.mid));
                     });
-                    peer.streamTransceivers[streamMsId].push(transceiver);
+                    let transceiver;
+                    if (idle) {
+                        idle.sender.replaceTrack(track);
+                        idle.direction = 'sendonly';
+                        if (idle.sender.setStreams)
+                            idle.sender.setStreams(rtcioStream.mediaStream);
+                        transceiver = idle;
+                        if (!peer.streamTransceivers[streamMsId].includes(idle)) {
+                            peer.streamTransceivers[streamMsId].push(idle);
+                        }
+                        this.log('debug', 'Pass 3 reused idle transceiver', {
+                            kind: track.kind, peer: peer.socketId,
+                        });
+                    }
+                    else {
+                        transceiver = peer.connection.addTransceiver(track, {
+                            direction: 'sendonly',
+                            streams: [rtcioStream.mediaStream],
+                        });
+                        peer.streamTransceivers[streamMsId].push(transceiver);
+                    }
                     this.wireTransceiverForStream(peer, rtcioStream, transceiver, track);
                     claimed.add(track.id);
+                    if (transceiver.mid != null)
+                        claimedTransceiverIds.add(transceiver.mid);
                 });
             });
             const tracks = rtcioStream.mediaStream.getTracks();
@@ -373,38 +409,9 @@ export class Socket extends RootSocket {
                 }
             };
             // Coalesces rapid-fire onnegotiationneeded into a single offer round.
-            peer.connection.onnegotiationneeded = async () => {
+            peer.connection.onnegotiationneeded = () => {
                 peer.connectionStatus.negotiationNeeded = true;
-                if (peer.connectionStatus.negotiationInProgress) {
-                    this.log('debug', 'onnegotiationneeded coalesced (negotiation in progress)', { peer: source });
-                    return;
-                }
-                // Yield so any synchronous addTransceiver calls in the same tick set the flag first.
-                await Promise.resolve();
-                while (peer.connectionStatus.negotiationNeeded) {
-                    peer.connectionStatus.negotiationNeeded = false;
-                    peer.connectionStatus.negotiationInProgress = true;
-                    try {
-                        peer.connectionStatus.makingOffer = true;
-                        this.log('debug', 'onnegotiationneeded — creating offer', { peer: source });
-                        await peer.connection.setLocalDescription();
-                        this.emit(RtcioEvents.MESSAGE, {
-                            target: peer.socketId,
-                            source: this.id,
-                            data: {
-                                description: peer.connection.localDescription,
-                            },
-                        });
-                        this.log('debug', 'Sent offer', { peer: source });
-                    }
-                    catch (error) {
-                        this.log('error', `onnegotiationneeded error: ${error === null || error === void 0 ? void 0 : error.message}`, { peer: source });
-                    }
-                    finally {
-                        peer.connectionStatus.makingOffer = false;
-                        peer.connectionStatus.negotiationInProgress = false;
-                    }
-                }
+                void this._runOfferLoop(peer, 'onnegotiationneeded');
             };
             // Built-in ctrl channel: negotiated:true so both polite and impolite sides
             // create it independently with the same id (0) — no DC-OPEN handshake, no
@@ -419,6 +426,83 @@ export class Socket extends RootSocket {
             });
             this._setupCtrlDc(ctrlDc, peer);
             return peer;
+        };
+        // ─── Offer loop ─────────────────────────────────────────────────────────
+        /**
+         * Coalesced offer/answer driver. Set `peer.connectionStatus.negotiationNeeded`
+         * before invoking — the loop drains the flag, so back-to-back triggers in
+         * the same tick collapse into a single offer round.
+         *
+         * Used by both `onnegotiationneeded` (the platform's own signal) and the
+         * synthetic path in `_triggerRenegotiation` (called from
+         * `RTCIOStream.setCodecPreferences`). The two callers want identical
+         * semantics — extracting the loop keeps them from drifting apart.
+         *
+         * Re-checks `rtcpeers[peerId]` inside the loop because the manual path
+         * runs across an `await Promise.resolve()` and `cleanupPeer` may fire
+         * during that window (watchdog timeout, unhealthy `connectionState`,
+         * server-side peer-left hint corroborated). Calling `setLocalDescription`
+         * on a closed connection throws an `InvalidStateError` we'd otherwise
+         * have to filter from the error log.
+         */
+        this._runOfferLoop = async (peer, reason) => {
+            if (peer.connectionStatus.negotiationInProgress) {
+                this.log('debug', `${reason} coalesced (negotiation in progress)`, { peer: peer.socketId });
+                return;
+            }
+            // Yield so any synchronous addTransceiver / setCodecPreferences calls
+            // in the same tick can flip the flag first and ride this same loop.
+            await Promise.resolve();
+            while (peer.connectionStatus.negotiationNeeded) {
+                // Bail if the peer was cleaned up while we were yielding — the
+                // connection may already be closed, and the rtcpeers entry gone.
+                if (this.rtcpeers[peer.socketId] !== peer ||
+                    peer.connection.signalingState === 'closed') {
+                    peer.connectionStatus.negotiationNeeded = false;
+                    return;
+                }
+                peer.connectionStatus.negotiationNeeded = false;
+                peer.connectionStatus.negotiationInProgress = true;
+                try {
+                    peer.connectionStatus.makingOffer = true;
+                    this.log('debug', `${reason} — creating offer`, { peer: peer.socketId });
+                    await peer.connection.setLocalDescription();
+                    this.emit(RtcioEvents.MESSAGE, {
+                        target: peer.socketId,
+                        source: this.id,
+                        data: {
+                            description: peer.connection.localDescription,
+                        },
+                    });
+                    this.log('debug', 'Sent offer', { peer: peer.socketId });
+                }
+                catch (error) {
+                    this.log('error', `${reason} error: ${error === null || error === void 0 ? void 0 : error.message}`, { peer: peer.socketId });
+                }
+                finally {
+                    peer.connectionStatus.makingOffer = false;
+                    peer.connectionStatus.negotiationInProgress = false;
+                }
+            }
+        };
+        /**
+         * Synthetic renegotiation trigger. The browser's `onnegotiationneeded`
+         * does **not** fire for `RTCRtpTransceiver.setCodecPreferences` changes
+         * — codec preferences only take effect on the next offer/answer pair, so
+         * something has to kick the cycle. This is that something.
+         *
+         * Takes a `peerId` (rather than a captured `RTCPeer`) so a stream's
+         * renegotiate callback that survives peer cleanup can no-op cleanly
+         * instead of operating on a stale peer reference.
+         */
+        this._triggerRenegotiation = (peerId) => {
+            const peer = this.rtcpeers[peerId];
+            if (!peer)
+                return;
+            if (peer.connection.signalingState === 'closed')
+                return;
+            peer.connectionStatus.negotiationNeeded = true;
+            void this._runOfferLoop(peer, 'manual renegotiation');
         };
         /**
          * Server-side peer-left hint handler. The signaling socket can drop
@@ -937,6 +1021,14 @@ export class Socket extends RootSocket {
         if (codecCb)
             this.applyCodecPreferences(transceiver, track, codecCb);
         rtcioStream._registerSender(peer.socketId, transceiver.sender);
+        // Stream's setCodecPreferences() needs both the transceiver (for
+        // `setCodecPreferences`) and a way to kick the offer cycle on this
+        // peer once preferences are updated. The callback closes over the
+        // socketId rather than the peer object so a stream that outlives
+        // peer cleanup can no-op cleanly instead of resurrecting a stale
+        // reference.
+        const peerId = peer.socketId;
+        rtcioStream._registerTransceiver(peerId, transceiver, () => this._triggerRenegotiation(peerId));
         const encoding = rtcioStream._getVideoEncoding();
         if (encoding && track.kind === 'video') {
             applyVideoEncodingToSender(transceiver.sender, encoding).catch((err) => {
