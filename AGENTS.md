@@ -320,22 +320,20 @@ await game.setEncoding({ contentHint: "detail", degradationPreference: "maintain
 
 `setEncoding` re-calls `RTCRtpSender.setParameters` on every tracked sender — no offer/answer round trip.
 
-For **codec** swaps mid-stream (e.g. user flips VP9 → AV1 in settings), use `setCodecPreferences`. The library re-applies the codec list on every tracked transceiver and kicks one offer/answer round per peer; the capture stream and senders survive — peers see at most a keyframe glitch:
+`codecPreferences` is **not** runtime-mutable. The library applies it once at transceiver creation; mid-stream codec swaps require renegotiation, and that renegotiation was found to disrupt audio on existing senders. For codec changes, tear down the stream and create a fresh one with new options:
 
 ```ts
-await game.setCodecPreferences((caps, kind) => {
-  if (kind !== "video") return caps;
-  const order = ["video/AV1", "video/VP9", "video/VP8", "video/H264"];
-  return order.flatMap(m => caps.filter(c => c.mimeType.toLowerCase() === m.toLowerCase()));
-});
+socket.untrackStream(game);
+game.mediaStream.getTracks().forEach(t => t.stop());
 
-// Reset to the browser default order:
-await game.setCodecPreferences(undefined);
+const fresh = await navigator.mediaDevices.getDisplayMedia({ /* same constraints */ });
+const newGame = new RTCIOStream(fresh, { /* same opts but new codecPreferences */ });
+socket.emit("game", newGame);
 ```
 
-Don't reach for stop+restart of the underlying capture to change codecs — for `getDisplayMedia` streams that re-prompts the user to pick the screen/window/tab again, which is hostile UX. `setCodecPreferences` exists specifically to avoid that.
+For `getDisplayMedia` this re-prompts the user to pick a screen/window/tab — there is no shortcut, the trade-off bought back stable audio on the rest of the call.
 
-For **resolution / frame rate** changes on a live capture, use `track.applyConstraints` on the underlying video track — also no renegotiation, no re-prompt. (Display-capture tracks have weaker `applyConstraints` semantics than camera tracks; some browsers ignore frame-rate caps. The encoder cap from `setEncoding` still bites.)
+For **resolution / frame rate** changes on a live capture, use `track.applyConstraints` on the underlying video track — no renegotiation, no re-prompt. (Display-capture tracks have weaker `applyConstraints` semantics than camera tracks; some browsers ignore frame-rate caps. The encoder cap from `setEncoding` still bites.)
 
 Verification recipe (do this once when tuning a deployment):
 
@@ -373,7 +371,7 @@ setInterval(async () => {
 | Reaching for `getPeer(id).connection.getSenders()` to call `setParameters` | Bypasses the per-stream registry; doesn't reapply on late joiners or replaced tracks | Pass `videoEncoding` to `new RTCIOStream(media, opts)` and use `stream.setEncoding(partial)` |
 | Using `getDisplayMedia()` defaults for game streaming | Conservative FPS/resolution defaults plus `degradationPreference: 'balanced'` collapse FPS on high motion | Set explicit `frameRate`/`width`/`height` and pass `videoEncoding: { contentHint: 'motion', degradationPreference: 'maintain-framerate', maxBitrate: ... }` |
 | Toggling mic/cam with `track.enabled = false` in a "video-call mute" UI | Device LED stays on; users think the app is still listening. Also triggers a Chrome bug where audio gets stuck silent for several seconds across enable/disable cycles | Use `track.stop()` + reacquire-and-`replaceTrack` on the way back up (pattern #8b) |
-| Stop+restart `getDisplayMedia` to change codec or resolution mid-share | Re-prompts the user to pick the screen/window/tab again — hostile UX | Use `stream.setCodecPreferences(cb)` for codec, `track.applyConstraints({ width, height, frameRate })` on the live track for resolution / FPS, `stream.setEncoding(...)` for encoder knobs |
+| Stop+restart `getDisplayMedia` to change resolution / FPS mid-share | Re-prompts the user to pick the screen/window/tab again — hostile UX | Use `track.applyConstraints({ width, height, frameRate })` on the live track for resolution / FPS, `stream.setEncoding(...)` for encoder knobs. Codec changes do require restart — there is no live setter |
 
 ---
 
@@ -487,7 +485,7 @@ socket.emit("screen-stopped");
 ```
 
 **Q: How do I stream a game / high-motion content without FPS collapsing?**
-Pass `videoEncoding` to `RTCIOStream`. The four levers, in order of impact: `degradationPreference: 'maintain-framerate'`, `contentHint: 'motion'`, raise `maxBitrate` to ~70-80% of uplink, prefer VP9/AV1 via `codecPreferences`. Full example in pattern #9 above. Use `stream.setEncoding(partial)` to react to network conditions at runtime (no renegotiation), `stream.setCodecPreferences(cb)` to swap codec mid-stream (one renegotiation per peer, capture stream survives), and `track.applyConstraints({ width, height, frameRate })` for live resolution / FPS changes.
+Pass `videoEncoding` to `RTCIOStream`. The four levers, in order of impact: `degradationPreference: 'maintain-framerate'`, `contentHint: 'motion'`, raise `maxBitrate` to ~70-80% of uplink, prefer VP9/AV1 via `codecPreferences`. Full example in pattern #9 above. Use `stream.setEncoding(partial)` to react to network conditions at runtime (no renegotiation), and `track.applyConstraints({ width, height, frameRate })` for live resolution / FPS changes. `codecPreferences` is fixed at construction — to swap codec mid-call, tear down the stream and create a fresh one.
 
 **Q: How do I detect a new peer?**
 `socket.on('peer-connect', ({ id }) => ...)`. Don't use the socket.io `connect` event — that fires when the socket reaches the server, not when a peer is reachable.
@@ -506,8 +504,8 @@ The library hot-swaps the sender track on every peer. No SDP renegotiation.
 **Q: My camera/mic LED stays on after the user clicks "off" — bug?**
 Not a bug; you used `track.enabled = false`. That mutes the wire but keeps the device open, and the LED is the platform's privacy indicator that the device is open. Use `track.stop()` instead, then reacquire via `getUserMedia` + `rtcioStream.replaceTrack(newTrack)` on the way back up. Full pattern in #8b.
 
-**Q: I want to change codec / resolution mid screen-share without re-prompting the user.**
-Use `stream.setCodecPreferences(cb)` for codec (one renegotiation per peer, the capture stream and the user's screen pick survive). Use `track.applyConstraints({ width, height, frameRate })` for resolution / FPS — same idea, no renegotiation, no re-prompt. Don't stop+restart `getDisplayMedia` for these changes; it forces the user to pick the screen again.
+**Q: I want to change resolution / FPS mid screen-share without re-prompting the user.**
+Use `track.applyConstraints({ width, height, frameRate })` on the live display-capture track — no renegotiation, no re-prompt. Encoder knobs (bitrate cap, contentHint, degradationPreference) update live via `stream.setEncoding(...)`. Codec changes are *not* live — the codec preference is fixed at transceiver creation, and a mid-call renegotiation to swap it disrupts audio. To change codec, tear down the stream and create a fresh one (which does re-prompt for `getDisplayMedia`).
 
 **Q: I emitted a stream, the receiver gets the event but `stream.mediaStream.getTracks()` is empty. Why?**
 You probably called `track.stop()` on the source tracks before emitting, or the `MediaStream` lost its tracks (e.g. `getDisplayMedia` cancelled). Inspect `stream.mediaStream.active` and the track list before emit.
