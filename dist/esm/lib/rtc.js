@@ -94,7 +94,14 @@ export class Socket extends RootSocket {
             // track with no SDP renegotiation. Toggling direction (sendonly→inactive→
             // sendonly) would also work but would round-trip an unnecessary offer/answer
             // and briefly mute the receiver.
-            rtcioStream.onTrackChanged((stream) => {
+            //
+            // Idempotency: if a stream is re-replayed to the same peer, we don't want
+            // two listeners firing (each would try to re-add transceivers). Drop the
+            // previous one before registering the new closure.
+            const prevUnsub = peer.outboundStreamUnsubs.get(streamMsId);
+            if (prevUnsub)
+                prevUnsub();
+            const unsubscribeTrackChanged = rtcioStream.onTrackChanged((stream) => {
                 var _a;
                 const tracks = stream.getTracks();
                 const trackById = new Map(tracks.map(t => [t.id, t]));
@@ -140,6 +147,12 @@ export class Socket extends RootSocket {
                     }
                 });
                 // Pass 3: brand-new tracks of a kind we don't have a transceiver for.
+                // Skip if the connection has gone away — we'd hit InvalidStateError
+                // from addTransceiver on a closed RTCPeerConnection. The cleanup path
+                // will detach this listener, but a track change racing with cleanup
+                // could otherwise reach here first.
+                if (peer.connection.connectionState === 'closed')
+                    return;
                 tracks.forEach(track => {
                     if (claimed.has(track.id))
                         return;
@@ -152,6 +165,7 @@ export class Socket extends RootSocket {
                     claimed.add(track.id);
                 });
             });
+            peer.outboundStreamUnsubs.set(streamMsId, unsubscribeTrackChanged);
             const tracks = rtcioStream.mediaStream.getTracks();
             if (tracks.length === 0) {
                 // No tracks yet — nothing to negotiate. onTrackChanged will fire when
@@ -201,6 +215,7 @@ export class Socket extends RootSocket {
             this.rtcpeers[source] = {
                 connection: peerConnection,
                 streams: {},
+                outboundStreamUnsubs: new Map(),
                 streamTransceivers: {},
                 socketId: source,
                 polite: options.polite,
@@ -1020,7 +1035,22 @@ export class Socket extends RootSocket {
         // Detach RTCIOStream listeners on inbound streams so the wrapper does not
         // pin the closed peer's MediaStream listeners. The MediaStream itself may
         // outlive the peer if the app handed it to a `<video>` element.
-        Object.values(peer.streams).forEach((s) => { var _a; return (_a = s.dispose) === null || _a === void 0 ? void 0 : _a.call(s); });
+        //
+        // Inbound vs outbound matters here. peer.streams holds both: inbound
+        // wrappers we created in ontrack, and outbound wrappers the user owns
+        // (registered in addTransceiverToPeer). Disposing an outbound wrapper
+        // would wipe the user's app-level callbacks AND every other connected
+        // peer's onTrackChanged listener — so future track swaps would silently
+        // stop reaching them. Drop only the per-peer onTrackChanged closure for
+        // outbounds, and dispose only the inbound wrappers we own.
+        const outboundMsIds = new Set(peer.outboundStreamUnsubs.keys());
+        Object.entries(peer.streams).forEach(([msId, s]) => {
+            var _a;
+            if (!outboundMsIds.has(msId))
+                (_a = s.dispose) === null || _a === void 0 ? void 0 : _a.call(s);
+        });
+        peer.outboundStreamUnsubs.forEach((unsub) => unsub());
+        peer.outboundStreamUnsubs.clear();
         // Drop sender registrations on every outbound stream so setEncoding()
         // no longer calls into senders attached to a closed RTCPeerConnection.
         // streamEvents is the authoritative outbound registry — peer.streams

@@ -92,6 +92,7 @@ type RTCPeer = {
     polite: boolean;
     connectionStatus: connectionStatus;
     streams: Record<string, RTCIOStream>;
+    outboundStreamUnsubs: Map<string, () => void>;
     streamTransceivers: Record<string, RTCRtpTransceiver[]>;
     ctrlDc: RTCDataChannel | null;
     ctrlQueue: string[];
