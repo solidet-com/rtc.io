@@ -87,6 +87,11 @@ class RTCIOStream {
     _getVideoEncoding() {
         return this._options.videoEncoding;
     }
+    /** @internal Library accessor for the slot purpose ('camera' / 'screen' / ...). */
+    _getPurpose() {
+        var _a;
+        return (_a = this._options.purpose) !== null && _a !== void 0 ? _a : 'camera';
+    }
     /**
      * @internal Called by the Socket when it creates an `RTCRtpSender` for
      * this stream on a peer. Tracks the sender so `setEncoding()` can re-apply

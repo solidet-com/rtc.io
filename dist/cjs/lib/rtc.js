@@ -77,135 +77,51 @@ class Socket extends socket_io_client_1.Socket {
             });
             this.signalingQueues[peerId] = current;
         };
+        /**
+         * Bind an outbound `RTCIOStream` to its slot on `peer`. Allocates the
+         * slot on first use (one `addTransceiver(audio)` + one `addTransceiver(video)`,
+         * both `sendrecv`), then routes the stream's tracks through
+         * `RTCRtpSender.replaceTrack` on the slot's senders. Subsequent track
+         * changes on the wrapper (mic mute/unmute, cam toggle, screen restart)
+         * also flow through `replaceTrack` — direction stays `sendrecv`, so
+         * none of these toggles trigger an SDP renegotiation.
+         *
+         * If the slot is already bound to a different stream (the user emitted
+         * a fresh wrapper for the same role — e.g. a new screen-share session),
+         * the old binding is released first so the slot becomes free, then the
+         * new stream takes it over.
+         */
         this.addTransceiverToPeer = (peer, rtcioStream) => {
             const streamMsId = rtcioStream.mediaStream.id;
-            this.log('debug', 'addTransceiverToPeer', {
+            const slotName = rtcioStream._getPurpose();
+            this.log('debug', 'bindStreamToSlot', {
                 peer: peer.socketId,
+                slot: slotName,
                 rtcioStreamId: rtcioStream.id,
                 mediaStreamId: streamMsId,
                 trackCount: rtcioStream.mediaStream.getTracks().length,
             });
-            // Store the stream reference even if it has no tracks
+            const slot = this.ensureSlot(peer, slotName);
+            // Re-binding the same stream is a no-op for slot identity but we
+            // still need to refresh tracks (the wrapper could have been
+            // replayed on reconnect). Different stream id → release the old
+            // binding first; the slot's transceivers are reused untouched.
+            if (slot.streamId && slot.streamId !== rtcioStream.id) {
+                this.releaseSlot(peer, slot);
+            }
+            slot.streamId = rtcioStream.id;
+            slot.msId = streamMsId;
             peer.streams[streamMsId] = rtcioStream;
-            // Initialise transceiver list for this stream if needed
-            if (!peer.streamTransceivers[streamMsId]) {
-                peer.streamTransceivers[streamMsId] = [];
-            }
-            // Listen for track changes on this stream (e.g. user swaps mic/cam mid-call).
-            // The same-kind swap path uses RTCRtpSender.replaceTrack and does NOT change
-            // transceiver direction, which is the WebRTC primitive for hot-swapping a
-            // track with no SDP renegotiation. Toggling direction (sendonly→inactive→
-            // sendonly) would also work but would round-trip an unnecessary offer/answer
-            // and briefly mute the receiver.
-            //
-            // Idempotency: if a stream is re-replayed to the same peer, we don't want
-            // two listeners firing (each would try to re-add transceivers). Drop the
-            // previous one before registering the new closure.
-            const prevUnsub = peer.outboundStreamUnsubs.get(streamMsId);
-            if (prevUnsub)
-                prevUnsub();
-            const unsubscribeTrackChanged = rtcioStream.onTrackChanged((stream) => {
-                var _a;
-                const tracks = stream.getTracks();
-                const trackById = new Map(tracks.map(t => [t.id, t]));
-                const ownTransceivers = (_a = peer.streamTransceivers[streamMsId]) !== null && _a !== void 0 ? _a : [];
-                const claimed = new Set();
-                // Pass 1: keep already-wired transceivers as-is.
-                ownTransceivers.forEach(t => {
-                    const senderTrack = t.sender.track;
-                    if (senderTrack && trackById.has(senderTrack.id)) {
-                        claimed.add(senderTrack.id);
-                    }
-                });
-                // Pass 2: rewire transceivers whose sender track was removed.
-                //   - If a same-kind replacement exists in the stream, hot-swap via
-                //     replaceTrack (no renegotiation).
-                //   - Otherwise mark the transceiver inactive (renegotiates) so the
-                //     remote stops expecting media on this m-line.
-                ownTransceivers.forEach(t => {
-                    var _a, _b;
-                    const senderTrack = t.sender.track;
-                    if (senderTrack && trackById.has(senderTrack.id))
-                        return;
-                    const kind = (_a = senderTrack === null || senderTrack === void 0 ? void 0 : senderTrack.kind) !== null && _a !== void 0 ? _a : (_b = t.receiver.track) === null || _b === void 0 ? void 0 : _b.kind;
-                    const replacement = tracks.find(tr => tr.kind === kind && !claimed.has(tr.id));
-                    if (replacement) {
-                        t.sender.replaceTrack(replacement);
-                        if (t.direction !== 'sendonly')
-                            t.direction = 'sendonly';
-                        if (t.sender.setStreams)
-                            t.sender.setStreams(rtcioStream.mediaStream);
-                        // replaceTrack reuses the same sender — no need to re-apply codec
-                        // preferences (which only affect SDP), but the encoding config may
-                        // need re-asserting if the new track has different defaults.
-                        const encoding = rtcioStream._getVideoEncoding();
-                        if (encoding && replacement.kind === 'video') {
-                            (0, stream_1.applyVideoEncodingToSender)(t.sender, encoding).catch(() => undefined);
-                        }
-                        claimed.add(replacement.id);
-                    }
-                    else if (senderTrack) {
-                        t.sender.replaceTrack(null);
-                        t.direction = 'inactive';
-                    }
-                });
-                // Pass 3: brand-new tracks of a kind we don't have a transceiver for.
-                // Skip if the connection has gone away — we'd hit InvalidStateError
-                // from addTransceiver on a closed RTCPeerConnection. The cleanup path
-                // will detach this listener, but a track change racing with cleanup
-                // could otherwise reach here first.
-                if (peer.connection.connectionState === 'closed')
-                    return;
-                tracks.forEach(track => {
-                    if (claimed.has(track.id))
-                        return;
-                    const transceiver = peer.connection.addTransceiver(track, {
-                        direction: 'sendonly',
-                        streams: [rtcioStream.mediaStream],
-                    });
-                    peer.streamTransceivers[streamMsId].push(transceiver);
-                    this.wireTransceiverForStream(peer, rtcioStream, transceiver, track);
-                    claimed.add(track.id);
-                });
-            });
-            peer.outboundStreamUnsubs.set(streamMsId, unsubscribeTrackChanged);
-            const tracks = rtcioStream.mediaStream.getTracks();
-            if (tracks.length === 0) {
-                // No tracks yet — nothing to negotiate. onTrackChanged will fire when
-                // the user adds tracks later and wire up transceivers then.
-                return;
-            }
-            tracks.forEach((track) => {
-                {
-                    // Reuse an unclaimed idle transceiver of the same kind to prevent accumulation.
-                    const claimedTransceiverIds = new Set(Object.values(peer.streamTransceivers).flat().map(t => t.mid));
-                    const idle = peer.connection.getTransceivers().find(t => {
-                        var _a;
-                        return t.sender.track === null
-                            && ((_a = t.receiver.track) === null || _a === void 0 ? void 0 : _a.kind) === track.kind
-                            && (t.direction === 'sendonly' || t.direction === 'sendrecv' || t.direction === 'inactive')
-                            && !claimedTransceiverIds.has(t.mid);
-                    });
-                    if (idle) {
-                        idle.sender.replaceTrack(track);
-                        idle.direction = "sendonly";
-                        // setStreams updates a=msid in SDP so the remote ontrack receives the correct stream id.
-                        if (idle.sender.setStreams) {
-                            idle.sender.setStreams(rtcioStream.mediaStream);
-                        }
-                        peer.streamTransceivers[streamMsId].push(idle);
-                        this.wireTransceiverForStream(peer, rtcioStream, idle, track);
-                        this.log('debug', 'Reused idle transceiver', { kind: track.kind, peer: peer.socketId });
-                    }
-                    else {
-                        const transceiver = peer.connection.addTransceiver(track, {
-                            direction: "sendonly",
-                            streams: [rtcioStream.mediaStream],
-                        });
-                        peer.streamTransceivers[streamMsId].push(transceiver);
-                        this.wireTransceiverForStream(peer, rtcioStream, transceiver, track);
-                    }
-                }
+            // Apply the stream's current tracks to the slot's senders.
+            this.applyTracksToSlot(peer, slot, rtcioStream);
+            // Subscribe for future track changes (mic toggle, cam toggle,
+            // device swap, replaceTrack on the wrapper). All of these route
+            // through the same `applyTracksToSlot` path — replaceTrack on the
+            // existing sender, no renegotiation.
+            if (slot.unsubscribe)
+                slot.unsubscribe();
+            slot.unsubscribe = rtcioStream.onTrackChanged(() => {
+                this.applyTracksToSlot(peer, slot, rtcioStream);
             });
         };
         /**
@@ -218,8 +134,7 @@ class Socket extends socket_io_client_1.Socket {
             this.rtcpeers[source] = {
                 connection: peerConnection,
                 streams: {},
-                outboundStreamUnsubs: new Map(),
-                streamTransceivers: {},
+                slots: new Map(),
                 socketId: source,
                 polite: options.polite,
                 connectionStatus: {
@@ -229,6 +144,7 @@ class Socket extends socket_io_client_1.Socket {
                     negotiationNeeded: false,
                     negotiationInProgress: false,
                 },
+                pendingCandidates: [],
                 ctrlDc: null,
                 ctrlQueue: [],
                 channels: {},
@@ -611,6 +527,17 @@ class Socket extends socket_io_client_1.Socket {
      */
     untrackStream(stream) {
         delete this.streamEvents[stream.id];
+        // Release the stream from every peer's slot it's currently bound
+        // to. The slot stays allocated — its transceivers are reused next
+        // time something binds to the same purpose, so screen-share
+        // stop/start cycles never accumulate m-lines.
+        Object.values(this.rtcpeers).forEach(peer => {
+            peer.slots.forEach(slot => {
+                if (slot.streamId === stream.id) {
+                    this.releaseSlot(peer, slot);
+                }
+            });
+        });
         return this;
     }
     /**
@@ -699,6 +626,7 @@ class Socket extends socket_io_client_1.Socket {
     }
     // https://w3c.github.io/webrtc-pc/#perfect-negotiation-example
     async handleCallServiceMessage(payload) {
+        var _a;
         const { source } = payload;
         let isNewPeer = false;
         let peer = this.getPeer(source);
@@ -750,6 +678,11 @@ class Socket extends socket_io_client_1.Socket {
             finally {
                 peer.connectionStatus.isSettingRemoteAnswerPending = false;
             }
+            // Remote description is in place — drain any candidates parked
+            // before/during this exchange. Order matters: we replay in
+            // arrival order so foundations resolve in the same sequence the
+            // remote sent them.
+            await this.drainPendingCandidates(peer);
             if (description.type === "offer") {
                 await peer.connection.setLocalDescription();
                 this.emit(events_1.RtcioEvents.MESSAGE, {
@@ -761,6 +694,14 @@ class Socket extends socket_io_client_1.Socket {
                 });
                 this.log('debug', 'Sent answer', { peer: source });
             }
+            // After a manual rollback the browser may not re-fire
+            // onnegotiationneeded for transceivers whose only delta is the
+            // `direction` field (mic just turned on, etc.) — the desired
+            // direction lives on the JS object but the negotiated SDP no
+            // longer reflects it. Belt-and-braces: if any transceiver's
+            // currentDirection diverges from its desired direction, mark
+            // negotiation as needed and kick the loop.
+            this.kickIfDirectionPending(peer);
             // Defer so this handler finishes before onnegotiationneeded fires on stream replay.
             // Re-check peer membership inside the microtask: between scheduling and
             // execution, ICE could have failed and cleanupPeer() could have removed
@@ -777,12 +718,38 @@ class Socket extends socket_io_client_1.Socket {
             }
         }
         else if (candidate) {
-            try {
-                await peer.connection.addIceCandidate(candidate);
+            // Defer candidates that arrive before we've installed a remote
+            // description (the very first signaling round, or right after a
+            // rollback when the browser briefly has no remoteDescription).
+            // drainPendingCandidates flushes the queue once setRemoteDescription
+            // completes. Without this, the browser throws InvalidStateError
+            // and the candidate is lost — silent half-open ICE is the result.
+            if (!peer.connection.remoteDescription) {
+                peer.pendingCandidates.push(candidate);
+                this.log('debug', 'Buffered ICE candidate (no remote description yet)', {
+                    peer: source, queued: peer.pendingCandidates.length,
+                });
             }
-            catch (err) {
-                if (!peer.connectionStatus.ignoreOffer)
-                    throw err;
+            else {
+                try {
+                    await peer.connection.addIceCandidate(candidate);
+                }
+                catch (err) {
+                    // Candidates arriving for an offer we ignored (impolite glare
+                    // rejection) are expected and harmless — drop quietly. Anything
+                    // else is a real failure: log it loudly instead of silently
+                    // swallowing, so half-open ICE shows up in debug logs.
+                    if (peer.connectionStatus.ignoreOffer) {
+                        this.log('debug', 'addIceCandidate during ignoreOffer (dropping)', {
+                            peer: source,
+                        });
+                    }
+                    else {
+                        this.log('warn', 'addIceCandidate failed', {
+                            peer: source, err: (_a = err === null || err === void 0 ? void 0 : err.message) !== null && _a !== void 0 ? _a : err,
+                        });
+                    }
+                }
             }
         }
         else if (events) {
@@ -840,6 +807,64 @@ class Socket extends socket_io_client_1.Socket {
             peer: peer.socketId,
             streamCount: Object.keys(this.streamEvents).length,
         });
+    }
+    /**
+     * Drain queued ICE candidates onto the peer connection. Called after
+     * each successful setRemoteDescription — buffered candidates sit in
+     * `peer.pendingCandidates` waiting for a remote description to attach
+     * to. We swallow per-candidate failures (the most common cause is a
+     * candidate whose mid no longer exists in the new description after a
+     * rollback) instead of aborting the drain, but log them so half-open
+     * ICE remains visible in debug output.
+     */
+    async drainPendingCandidates(peer) {
+        var _a;
+        if (peer.pendingCandidates.length === 0)
+            return;
+        const queued = peer.pendingCandidates.splice(0, peer.pendingCandidates.length);
+        this.log('debug', 'Draining buffered ICE candidates', {
+            peer: peer.socketId, count: queued.length,
+        });
+        for (const cand of queued) {
+            try {
+                await peer.connection.addIceCandidate(cand);
+            }
+            catch (err) {
+                this.log('warn', 'Buffered addIceCandidate failed', {
+                    peer: peer.socketId, err: (_a = err === null || err === void 0 ? void 0 : err.message) !== null && _a !== void 0 ? _a : err,
+                });
+            }
+        }
+    }
+    /**
+     * Re-arm the negotiation loop if any transceiver's desired direction
+     * differs from what's currently negotiated. The browser is supposed to
+     * fire `onnegotiationneeded` whenever this drifts, but post-rollback
+     * Chrome and Firefox have historically been inconsistent about firing
+     * for direction-only changes. Calling this after a rollback path makes
+     * sure the pending mic/cam toggle that originally triggered the
+     * (now-rolled-back) offer eventually goes out.
+     */
+    kickIfDirectionPending(peer) {
+        var _a, _b;
+        if (peer.connection.signalingState !== 'stable')
+            return;
+        const drift = peer.connection.getTransceivers().some(t => {
+            const want = t.direction;
+            const have = t.currentDirection;
+            return have !== null && want !== have;
+        });
+        if (!drift)
+            return;
+        this.log('debug', 'Re-arming negotiation after rollback (direction drift)', {
+            peer: peer.socketId,
+        });
+        // Set the flag and call the handler the same way the browser would.
+        // onnegotiationneeded is async and self-coalescing, so calling it
+        // here when a real fire is also in flight is safe — the loop checks
+        // `negotiationInProgress` and falls through.
+        peer.connectionStatus.negotiationNeeded = true;
+        (_b = (_a = peer.connection).onnegotiationneeded) === null || _b === void 0 ? void 0 : _b.call(_a, new Event('negotiationneeded'));
     }
     /** Polite path: initiates the offer and replays any local streams immediately. */
     initializeConnection(payload, options = { polite: true }) {
@@ -941,28 +966,154 @@ class Socket extends socket_io_client_1.Socket {
         }
     }
     /**
-     * Wire a transceiver that we've just associated with `rtcioStream`:
+     * Allocate a slot for `name` on `peer`, or return the existing one.
      *
-     *   - Apply codec preferences (must run before negotiation).
-     *   - Apply video encoding params (`maxBitrate`, `degradationPreference`,
-     *     etc.) — async; fired-and-forgotten because it doesn't affect SDP.
-     *   - Register the sender with the stream so `setEncoding()` can re-apply
-     *     params at runtime, and unregistration on peer cleanup keeps the
-     *     registry from leaking dead senders.
+     * **Adoption** is the key trick: on the impolite side, by the time we
+     * get here `setRemoteDescription` has already auto-created receive-only
+     * audio + video transceivers from the polite peer's offer. Allocating
+     * fresh ones with `addTransceiver` would put the impolite's outbound
+     * media on a *separate* m-line pair, doubling the SDP and giving us
+     * 4 m-lines per peer pair instead of 2. Instead, we look for
+     * unclaimed audio + video transceivers already on the connection,
+     * adopt them as the slot's senders, and flip direction to `sendrecv`
+     * so we can send back. Result: each peer pair has exactly one m=audio
+     * + one m=video, bidirectional, and mute/unmute is just `replaceTrack`.
+     *
+     * On the polite side the connection has no transceivers when the
+     * first slot allocates, so adoption finds nothing and we fall through
+     * to a clean `addTransceiver` pair.
      */
-    wireTransceiverForStream(peer, rtcioStream, transceiver, track) {
-        const codecCb = rtcioStream._getCodecPreferences();
-        if (codecCb)
-            this.applyCodecPreferences(transceiver, track, codecCb);
-        rtcioStream._registerSender(peer.socketId, transceiver.sender);
-        const encoding = rtcioStream._getVideoEncoding();
-        if (encoding && track.kind === 'video') {
-            (0, stream_1.applyVideoEncodingToSender)(transceiver.sender, encoding).catch((err) => {
-                this.log('warn', 'applyVideoEncodingToSender failed', {
-                    peer: peer.socketId, err,
-                });
+    ensureSlot(peer, name) {
+        let slot = peer.slots.get(name);
+        if (slot)
+            return slot;
+        const ownedMids = new Set();
+        peer.slots.forEach(s => {
+            if (s.audio.mid)
+                ownedMids.add(s.audio.mid);
+            if (s.video.mid)
+                ownedMids.add(s.video.mid);
+        });
+        const transceivers = peer.connection.getTransceivers();
+        const isAdoptable = (t, kind) => {
+            var _a;
+            return ((_a = t.receiver.track) === null || _a === void 0 ? void 0 : _a.kind) === kind &&
+                t.sender.track === null &&
+                (!t.mid || !ownedMids.has(t.mid));
+        };
+        const adoptedAudio = transceivers.find(t => isAdoptable(t, 'audio'));
+        const adoptedVideo = transceivers.find(t => isAdoptable(t, 'video') && t !== adoptedAudio);
+        if (adoptedAudio && adoptedVideo) {
+            this.log('debug', 'Adopting transceivers for slot', {
+                peer: peer.socketId, slot: name,
+                audioMid: adoptedAudio.mid, videoMid: adoptedVideo.mid,
             });
+            // Flip direction to sendrecv so we can transmit. This change
+            // triggers one renegotiation cycle the next time the
+            // browser's negotiation-needed bookkeeping runs — that's the
+            // signal to the polite side that we now have media to send.
+            if (adoptedAudio.direction !== 'sendrecv')
+                adoptedAudio.direction = 'sendrecv';
+            if (adoptedVideo.direction !== 'sendrecv')
+                adoptedVideo.direction = 'sendrecv';
+            slot = {
+                audio: adoptedAudio,
+                video: adoptedVideo,
+                streamId: null,
+                msId: null,
+                unsubscribe: null,
+            };
         }
+        else {
+            this.log('debug', 'Allocating fresh slot', { peer: peer.socketId, slot: name });
+            slot = {
+                audio: peer.connection.addTransceiver('audio', { direction: 'sendrecv' }),
+                video: peer.connection.addTransceiver('video', { direction: 'sendrecv' }),
+                streamId: null,
+                msId: null,
+                unsubscribe: null,
+            };
+        }
+        peer.slots.set(name, slot);
+        return slot;
+    }
+    /**
+     * Apply the wrapper's current tracks to its slot's senders. The slot
+     * has exactly one audio sender and one video sender, so there is no
+     * "find the matching transceiver" search — kind picks the sender,
+     * `replaceTrack` does the rest. A null track means "nothing to send"
+     * (mute) — direction stays `sendrecv` so the m-line keeps existing.
+     */
+    applyTracksToSlot(peer, slot, rtcioStream) {
+        var _a, _b;
+        // Race with cleanup: the listener fires synchronously on the
+        // wrapper, which can outlive the peer (it's owned by user code).
+        if (peer.connection.connectionState === 'closed')
+            return;
+        const tracks = rtcioStream.mediaStream.getTracks();
+        const audioTrack = (_a = tracks.find(t => t.kind === 'audio')) !== null && _a !== void 0 ? _a : null;
+        const videoTrack = (_b = tracks.find(t => t.kind === 'video')) !== null && _b !== void 0 ? _b : null;
+        this.applyTrackToSender(peer, rtcioStream, slot.audio, audioTrack);
+        this.applyTrackToSender(peer, rtcioStream, slot.video, videoTrack);
+    }
+    applyTrackToSender(peer, rtcioStream, transceiver, track) {
+        const sender = transceiver.sender;
+        if (sender.track === track)
+            return;
+        // `replaceTrack` is async but the renegotiation-free guarantee
+        // applies as long as we don't change kind or direction — neither
+        // of which we do. Failures are rare (track ended in the same tick)
+        // and we just log them; the transceiver stays at its previous
+        // track, which is the safest fallback.
+        sender.replaceTrack(track).catch(err => {
+            var _a;
+            this.log('warn', 'replaceTrack failed', {
+                peer: peer.socketId, kind: (_a = transceiver.receiver.track) === null || _a === void 0 ? void 0 : _a.kind, err,
+            });
+        });
+        if (track) {
+            // setStreams keeps a=msid pointing at the wrapper's MediaStream
+            // so the remote's `ontrack` callback gets a stream whose .id
+            // matches what the metadata-exchange protocol expects.
+            if (sender.setStreams)
+                sender.setStreams(rtcioStream.mediaStream);
+            // Codec prefs and encoding params re-applied on every bind so
+            // a fresh stream of an existing slot picks up the wrapper's
+            // configuration. setCodecPreferences only affects the next
+            // SDP exchange — it's a no-op when no renegotiation follows.
+            const codecCb = rtcioStream._getCodecPreferences();
+            if (codecCb)
+                this.applyCodecPreferences(transceiver, track, codecCb);
+            rtcioStream._registerSender(peer.socketId, sender);
+            const encoding = rtcioStream._getVideoEncoding();
+            if (encoding && track.kind === 'video') {
+                (0, stream_1.applyVideoEncodingToSender)(sender, encoding).catch(err => {
+                    this.log('warn', 'applyVideoEncodingToSender failed', {
+                        peer: peer.socketId, err,
+                    });
+                });
+            }
+        }
+    }
+    /**
+     * Release a slot from its current binding without tearing down the
+     * transceivers. Senders go to `replaceTrack(null)` (silent), the
+     * onTrackChanged listener is detached, and the slot is marked free.
+     * Direction stays `sendrecv` so the next bind reuses the same m-lines
+     * with zero SDP work.
+     */
+    releaseSlot(peer, slot) {
+        if (slot.unsubscribe) {
+            slot.unsubscribe();
+            slot.unsubscribe = null;
+        }
+        slot.audio.sender.replaceTrack(null).catch(() => undefined);
+        slot.video.sender.replaceTrack(null).catch(() => undefined);
+        if (slot.msId) {
+            delete peer.streams[slot.msId];
+        }
+        slot.streamId = null;
+        slot.msId = null;
     }
     // ─── Liveness watchdog ──────────────────────────────────────────────────
     /**
@@ -1026,6 +1177,9 @@ class Socket extends socket_io_client_1.Socket {
             return;
         this.log('debug', 'Cleaning up peer', { peer: peerId });
         this._clearUnhealthyTimer(peer);
+        // Drop any candidates still parked for a remote description that
+        // will never arrive — the connection is going away.
+        peer.pendingCandidates.length = 0;
         // Close ctrl channel + clear pre-open queue
         if (peer.ctrlDc &&
             peer.ctrlDc.readyState !== "closed" &&
@@ -1041,19 +1195,21 @@ class Socket extends socket_io_client_1.Socket {
         //
         // Inbound vs outbound matters here. peer.streams holds both: inbound
         // wrappers we created in ontrack, and outbound wrappers the user owns
-        // (registered in addTransceiverToPeer). Disposing an outbound wrapper
+        // (registered when the slot bound). Disposing an outbound wrapper
         // would wipe the user's app-level callbacks AND every other connected
         // peer's onTrackChanged listener — so future track swaps would silently
         // stop reaching them. Drop only the per-peer onTrackChanged closure for
         // outbounds, and dispose only the inbound wrappers we own.
-        const outboundMsIds = new Set(peer.outboundStreamUnsubs.keys());
+        const outboundMsIds = new Set();
+        peer.slots.forEach(slot => { if (slot.msId)
+            outboundMsIds.add(slot.msId); });
         Object.entries(peer.streams).forEach(([msId, s]) => {
             var _a;
             if (!outboundMsIds.has(msId))
                 (_a = s.dispose) === null || _a === void 0 ? void 0 : _a.call(s);
         });
-        peer.outboundStreamUnsubs.forEach((unsub) => unsub());
-        peer.outboundStreamUnsubs.clear();
+        peer.slots.forEach(slot => { var _a; return (_a = slot.unsubscribe) === null || _a === void 0 ? void 0 : _a.call(slot); });
+        peer.slots.clear();
         // Drop sender registrations on every outbound stream so setEncoding()
         // no longer calls into senders attached to a closed RTCPeerConnection.
         // streamEvents is the authoritative outbound registry — peer.streams
