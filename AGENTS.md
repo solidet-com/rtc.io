@@ -99,10 +99,9 @@ old?.stop();
 // ✅ Works — the library finds the RTCIOStream nested inside the object
 socket.emit("stream", {
   screen: new RTCIOStream(displayStream),
-  metadata: { userId: "abc123", displayName: "Alice", dummyKey:"dummyData"},
+  metadata: { userId: "abc123", displayName: "Alice", dummyKey: "dummyData" },
 });
-
-
+```
 
 ### Server escape hatch
 
