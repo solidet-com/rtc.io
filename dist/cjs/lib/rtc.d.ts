@@ -86,37 +86,18 @@ export interface SocketOptions extends Partial<RootSocketOptions> {
      */
     watchdog?: WatchdogOptions;
 }
-/**
- * One outbound role on a peer connection: a long-lived `(audio, video)`
- * transceiver pair that any number of streams of the same `purpose` can be
- * bound to over the call lifetime. All track add / swap / remove flows go
- * through `RTCRtpSender.replaceTrack` on these senders, so mute and unmute
- * are renegotiation-free.
- *
- * Direction stays `sendrecv` for the slot's whole life — even when the
- * sender has no track. This is the canonical Meet / Zoom-web pattern: the
- * m-line is reusable next time without further SDP work.
- */
-type Slot = {
-    audio: RTCRtpTransceiver;
-    video: RTCRtpTransceiver;
-    streamId: string | null;
-    msId: string | null;
-    unsubscribe: (() => void) | null;
-};
 type RTCPeer = {
     connection: RTCPeerConnection;
     socketId: string;
     polite: boolean;
     connectionStatus: connectionStatus;
     streams: Record<string, RTCIOStream>;
-    slots: Map<string, Slot>;
+    streamTransceivers: Record<string, RTCRtpTransceiver[]>;
     ctrlDc: RTCDataChannel | null;
     ctrlQueue: string[];
     channels: Record<string, RTCIOChannel>;
     channelIds: Map<number, string>;
     connectFired: boolean;
-    pendingCandidates: RTCIceCandidate[];
     unhealthyTimer: ReturnType<typeof setTimeout> | null;
     peerLeftHintAt: number;
 };
@@ -195,26 +176,6 @@ export declare class Socket extends RootSocket {
     private enqueueSignalingMessage;
     handleCallServiceMessage(payload: MessagePayload): Promise<void>;
     private replayStreamsToPeer;
-    /**
-     * Drain queued ICE candidates onto the peer connection. Called after
-     * each successful setRemoteDescription — buffered candidates sit in
-     * `peer.pendingCandidates` waiting for a remote description to attach
-     * to. We swallow per-candidate failures (the most common cause is a
-     * candidate whose mid no longer exists in the new description after a
-     * rollback) instead of aborting the drain, but log them so half-open
-     * ICE remains visible in debug output.
-     */
-    private drainPendingCandidates;
-    /**
-     * Re-arm the negotiation loop if any transceiver's desired direction
-     * differs from what's currently negotiated. The browser is supposed to
-     * fire `onnegotiationneeded` whenever this drifts, but post-rollback
-     * Chrome and Firefox have historically been inconsistent about firing
-     * for direction-only changes. Calling this after a rollback path makes
-     * sure the pending mic/cam toggle that originally triggered the
-     * (now-rolled-back) offer eventually goes out.
-     */
-    private kickIfDirectionPending;
     /** Polite path: initiates the offer and replays any local streams immediately. */
     initializeConnection(payload: MessagePayload, options?: {
         polite: boolean;
@@ -231,56 +192,17 @@ export declare class Socket extends RootSocket {
      */
     private applyCodecPreferences;
     /**
-     * Bind an outbound `RTCIOStream` to its slot on `peer`. Allocates the
-     * slot on first use (one `addTransceiver(audio)` + one `addTransceiver(video)`,
-     * both `sendrecv`), then routes the stream's tracks through
-     * `RTCRtpSender.replaceTrack` on the slot's senders. Subsequent track
-     * changes on the wrapper (mic mute/unmute, cam toggle, screen restart)
-     * also flow through `replaceTrack` — direction stays `sendrecv`, so
-     * none of these toggles trigger an SDP renegotiation.
+     * Wire a transceiver that we've just associated with `rtcioStream`:
      *
-     * If the slot is already bound to a different stream (the user emitted
-     * a fresh wrapper for the same role — e.g. a new screen-share session),
-     * the old binding is released first so the slot becomes free, then the
-     * new stream takes it over.
+     *   - Apply codec preferences (must run before negotiation).
+     *   - Apply video encoding params (`maxBitrate`, `degradationPreference`,
+     *     etc.) — async; fired-and-forgotten because it doesn't affect SDP.
+     *   - Register the sender with the stream so `setEncoding()` can re-apply
+     *     params at runtime, and unregistration on peer cleanup keeps the
+     *     registry from leaking dead senders.
      */
+    private wireTransceiverForStream;
     private addTransceiverToPeer;
-    /**
-     * Allocate a slot for `name` on `peer`, or return the existing one.
-     *
-     * **Adoption** is the key trick: on the impolite side, by the time we
-     * get here `setRemoteDescription` has already auto-created receive-only
-     * audio + video transceivers from the polite peer's offer. Allocating
-     * fresh ones with `addTransceiver` would put the impolite's outbound
-     * media on a *separate* m-line pair, doubling the SDP and giving us
-     * 4 m-lines per peer pair instead of 2. Instead, we look for
-     * unclaimed audio + video transceivers already on the connection,
-     * adopt them as the slot's senders, and flip direction to `sendrecv`
-     * so we can send back. Result: each peer pair has exactly one m=audio
-     * + one m=video, bidirectional, and mute/unmute is just `replaceTrack`.
-     *
-     * On the polite side the connection has no transceivers when the
-     * first slot allocates, so adoption finds nothing and we fall through
-     * to a clean `addTransceiver` pair.
-     */
-    private ensureSlot;
-    /**
-     * Apply the wrapper's current tracks to its slot's senders. The slot
-     * has exactly one audio sender and one video sender, so there is no
-     * "find the matching transceiver" search — kind picks the sender,
-     * `replaceTrack` does the rest. A null track means "nothing to send"
-     * (mute) — direction stays `sendrecv` so the m-line keeps existing.
-     */
-    private applyTracksToSlot;
-    private applyTrackToSender;
-    /**
-     * Release a slot from its current binding without tearing down the
-     * transceivers. Senders go to `replaceTrack(null)` (silent), the
-     * onTrackChanged listener is detached, and the slot is marked free.
-     * Direction stays `sendrecv` so the next bind reuses the same m-lines
-     * with zero SDP work.
-     */
-    private releaseSlot;
     /**
      * Creates peer connection
      * @returns {RTCPeerConnection} instance of RTCPeerConnection.

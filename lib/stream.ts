@@ -134,20 +134,6 @@ export interface RTCIOStreamOptions {
 	videoEncoding?: VideoEncodingConfig;
 	/** Codec preference selector. See {@link CodecPreferenceCallback}. */
 	codecPreferences?: CodecPreferenceCallback;
-	/**
-	 * Logical role of this stream on the peer connection. Streams with the
-	 * same purpose share a long-lived `(audio, video)` transceiver pair on
-	 * each peer — track changes, mute toggles, and stream replacements all
-	 * go through `RTCRtpSender.replaceTrack` on those existing transceivers,
-	 * so they never trigger SDP renegotiation.
-	 *
-	 * Defaults to `'camera'`. Pass `'screen'` for screen-share streams so
-	 * they get their own slot instead of clobbering the camera one. Any
-	 * other string works too — the library lazy-allocates a fresh slot per
-	 * unique purpose, the same way Meet/LiveKit pre-allocate per stream
-	 * role.
-	 */
-	purpose?: string;
 }
 
 export class RTCIOStream {
@@ -212,11 +198,6 @@ export class RTCIOStream {
 	/** @internal Library accessor for the current encoding config. */
 	_getVideoEncoding(): VideoEncodingConfig | undefined {
 		return this._options.videoEncoding;
-	}
-
-	/** @internal Library accessor for the slot purpose ('camera' / 'screen' / ...). */
-	_getPurpose(): string {
-		return this._options.purpose ?? 'camera';
 	}
 
 	/**
